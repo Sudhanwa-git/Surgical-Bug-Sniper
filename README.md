@@ -1,108 +1,138 @@
-# 🎯 Surgical Bug Sniper (SBK)
+Surgical Bug Sniper
+===================
 
-Surgical Bug Sniper (SBK) is an autonomous, state-driven agentic pipeline designed to scan open-source repositories for actionable bugs, reproduce/verify them locally, perform precise code surgery using local LLMs (via Ollama) and Aider, and submit automated fixes back to GitHub via pull requests.
+Surgical Bug Sniper is an autonomous AI agent designed as a local-first pipeline to Hunt, Clone, Fix, Verify, and Commit pull requests for bugs in AI infrastructure repositories. 
 
-Optimized specifically for consumer GPUs (like an RTX 3050 with 6GB VRAM), SBK offloads high-level discovery tasks and integrates powerful local coding models to run entirely free of API token fees.
+Optimized to run on consumer hardware like a 6GB VRAM RTX 3050, it combines local LLM inference via Ollama with GitHub's developer APIs to run entirely free of API fees.
+
+The system uses a custom, lightweight Python class orchestrator rather than external agentic frameworks like LangChain, keeping dependency overhead to an absolute minimum.
 
 ---
 
-## 🛠️ Architecture & Pipeline Flow
+Tech Stack
+----------
 
-SBK operates as a sequential pipeline with the following modules:
+Core Runtime
+- Python 3.10+ utilizing ThreadPoolExecutor for concurrent scouting, subprocess for local execution, and requests for API interaction.
 
-```mermaid
-graph TD
-    A[1. HUNT] -->|Find issues via GitHub API| B[2. CLONE]
-    B -->|Blobless shallow clone| C[3. SURGERY]
-    C -->|Local Ollama + Aider surgery| D[4. VERIFY]
-    D -->|Python syntax / test suite checks| E[5. PUSH]
-    E -->|Fork & branch push| F[6. PR CREATION]
-    F -->|Create upstream Pull Request| G[MISSION COMPLETE]
+Agent Orchestrator
+- A custom, pure Python stateful pipeline class defined in sbk.py. No LangChain or LangGraph dependencies.
+
+Coding LLM and Inference Engine
+- Ollama running Qwen 2.5 Coder 7B (Q4_K_M).
+
+User Interface
+- Streamlit (v1.37+) with fragment-scoped log streaming and custom dark-mode CSS.
+
+Version Control and APIs
+- Git CLI and GitHub REST API (v3) with TCP connection pooling and retries.
+
+---
+
+System Architecture
+-------------------
+
+```
+[ Streamlit Web UI ] (FIRE / ABORT Controls)
+                   |
+                   v
+              [ 1. Hunt ]
+         (GitHub REST API Scan)
+                   |
+                   v
+              [ 2. Clone ]
+        (Shallow Blobless Clone)
+                   |
+                   v
+               [ 3. Fix ]
+        (Ollama qwen2.5-coder:7b)
+                   |
+                   v
+             [ 4. Verify ]
+           (py_compile check)
+                   |
+                   v
+             [ 5. Commit ]
+          (Git Branch & Stage)
+                   |
+                   v
+         [ Upstream GitHub PR ]
+        (Fork, Commit, Push, PR)
 ```
 
-1. **The Scout (Hunt):** Scans a whitelist of repositories in parallel for open bug issues using GitHub API, prioritizing reports with error tracebacks, exceptions, code blocks, or precise filenames.
-2. **The Laboratory (Clone):** Performs a blobless, shallow clone of the target repository to minimize disk/memory usage.
-3. **The Surgeon (Surgery):** Employs **Qwen 2.5 Coder 7B** (via Ollama) and a smart sliding context window to generate search-and-replace patches matching the target codebase's exact syntax and styling.
-4. **The Gatekeeper (Verify):** Performs compilation and syntax checks on modified files to verify no syntax errors were introduced.
-5. **The Diplomat (Push & PR):** Automates the forks, branches, atomic commits, pushes, and opening of Pull Requests on GitHub.
+Execution Pipeline
+------------------
+
+1. Hunt
+- Tool: GitHub REST API (v3) with concurrent ThreadPoolExecutor.
+- Action: Runs parallel scans across whitelisted repositories. Uses heuristics to filter and rank bug reports containing actionable technical indicators (like tracebacks, exceptions, code blocks, or file references).
+
+2. Clone
+- Tool: Git CLI.
+- Action: Performs a clean, shallow, blobless clone (--depth 1 --filter=blob:none) to target TEMP directories, deleting old repositories on startup to prevent stale context.
+
+3. Fix
+- Tool: Ollama running Qwen 2.5 Coder 7B.
+- Action: Generates a SEARCH/REPLACE diff patch. Optimizes local context windows by parsing a code segment (up to 35,000 characters) surrounding key identifiers, then patches files using exact matching, fuzzy whitespace matching, or indentation-agnostic logic.
+
+4. Verify
+- Tool: Python py_compile compiler.
+- Action: Automatically runs compile-time syntax checks on all modified code files. It aborts the pipeline if syntax errors are found, avoiding broken commits.
+
+5. Commit
+- Tool: Git CLI and GitHub REST API (v3).
+- Action: Sets git configuration, branches, stages modified files, creates atomic commits, forks the repository via API, pushes the branch to your account, and opens a pull request targeting main or master.
 
 ---
 
-## 💻 Streamlit UI Control Dashboard
+Setup and Installation
+----------------------
 
-The project includes a sleek, dark-themed Streamlit dashboard providing live visual feedback.
+Prerequisites
+- Python 3.10+
+- Git CLI (configured and authenticated to GitHub)
+- Ollama running locally
 
-- **Real-Time Step Tracker:** Visually tracks the active step (Hunt -> Clone -> Surgery -> Verify -> Push).
-- **Live Operation Feed:** Feeds raw logs from the backend execution continuously with auto-scrolling terminal logs.
-- **Controls:** Easy **FIRE** launch trigger and **ABORT** kill switch to safely stop running sub-processes.
-
----
-
-## 🚀 Setup & Installation
-
-### 1. Prerequisites
-- **Python 3.10+**
-- **Git** installed and authenticated on your local machine.
-- **Ollama** installed and running on your host machine.
-
-### 2. Install Local Model
-Ensure Ollama is running and download the coding model:
+Download the Model
 ```bash
 ollama pull qwen2.5-coder:7b
 ```
 
-### 3. Setup Project Environment
-Clone this repository and navigate to the project folder:
+Install Dependencies
 ```bash
 git clone https://github.com/your-username/surgical-bug-sniper.git
 cd surgical-bug-sniper
-```
-
-Create a virtual environment and install requirements:
-```bash
 python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+On Windows, activate the virtual environment using: .venv\Scripts\activate
 
-### 4. Configure Environment Variables
-Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
-Edit the `.env` file to configure your settings, especially your **`GITHUB_TOKEN`**:
+Configure Environment
+Create a .env file in the root directory:
 ```ini
-GITHUB_TOKEN=your_personal_access_token_here
+GITHUB_TOKEN=ghp_your_github_token_here
 AIDER_MODEL=ollama_chat/qwen2.5-coder:7b
 OLLAMA_API_BASE=http://localhost:11434
+MAX_BUGS_PER_REPO=3
+SURGERY_CONTEXT_CHARS=35000
+SURGERY_TIMEOUT_SEC=180
 ```
 
 ---
 
-## 🎯 Usage
+Usage
+-----
 
-### Streamlit Control Panel (Recommended)
-Launch the interactive web UI:
+Web UI
+Launch the control panel dashboard:
 ```bash
 streamlit run sbk_ui.py
 ```
-Open your browser to the URL printed in your console (usually `http://localhost:8501`). Click **FIRE** to start hunting!
+Open http://localhost:8501 to monitor the live operation feed.
 
-### CLI Mode
-You can also run the pipeline directly from the command line:
+CLI Mode
+Run the pipeline directly in your terminal:
 ```bash
 python sbk.py
 ```
-
----
-
-## 🔍 Whitelisted Target Repositories
-By default, the Scout is configured to scan and target:
-- `langchain-ai/langgraph`
-- `joaomdmoura/crewAI`
-- `run-llama/llama_index`
-- `qdrant/qdrant`
-- `ollama/ollama`
-- `vllm-project/vllm`
-
-You can modify the target repositories by editing the `WHITELIST` in `sbk.py`.

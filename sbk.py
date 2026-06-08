@@ -177,7 +177,10 @@ class RepoHunter:
 # ═══════════════════════════════════════════════════════════════════════════════
 class AutoCloner:
     def __init__(self):
-        self.base = os.path.join(os.environ.get("TEMP", "C:\\temp"), "sbk_hunts")
+        if sys.platform == "win32":
+            self.base = "C:\\temp\\sbk_hunts"
+        else:
+            self.base = os.path.join(os.environ.get("TEMP", "/tmp"), "sbk_hunts")
         os.makedirs(self.base, exist_ok=True)
 
     def _rmdir(self, path):
@@ -849,9 +852,10 @@ class SurgicalBugSniper:
 
         if not done_first:
             return None, []
-        # Pick the repo with the most bugs for best odds of a successful fix
-        done_first.sort(key=lambda x: len(x[1]), reverse=True)
-        return done_first[0]
+        # Pick a target repository randomly from the ones that returned bugs
+        selected = random.choice(done_first)
+        log(f"[ HUNT ] Selected random target: {selected[0]['full_name']} with {len(selected[1])} bug(s)")
+        return selected
 
     def run(self):
         log("=" * 62)
