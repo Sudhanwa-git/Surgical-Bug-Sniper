@@ -289,10 +289,7 @@ st.markdown("---")
 #   rather than using run_every= so we can stop refreshing when idle.
 # - Only 2 DOM elements update per tick: the tracker HTML + the code block.
 @st.fragment
-def live_feed():
-    current_pid = st.session_state.get("process_pid")
-
-    # ── Sidebar Metrics ───────────────────────────────────────────────────────
+def sidebar_metrics():
     import metrics
     m = metrics.get_metrics()
     
@@ -319,8 +316,17 @@ def live_feed():
         <span style="color: #ffffff; font-weight: bold;">{m.get('prs_closed', 0)}</span>
     </div>
     """
-    with st.sidebar:
-        st.markdown(metrics_html, unsafe_allow_html=True)
+    st.markdown(metrics_html, unsafe_allow_html=True)
+    
+    current_pid = st.session_state.get("process_pid")
+    running = current_pid is not None
+    if running:
+        time.sleep(0.7)
+        st.rerun()
+
+@st.fragment
+def live_feed():
+    current_pid = st.session_state.get("process_pid")
 
     # ── Detect process death ──────────────────────────────────────────────────
     if current_pid is not None and not psutil.pid_exists(current_pid):
@@ -351,5 +357,8 @@ def live_feed():
         time.sleep(0.7)          # 0.7s tick — smooth without hammering CPU
         st.rerun()               # fragment-only rerun (Streamlit 1.37+)
 
+
+with st.sidebar:
+    sidebar_metrics()
 
 live_feed()
