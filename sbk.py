@@ -6,7 +6,7 @@ v5: Full fix — broader bug discovery, robust surgery, PR creation,
     fast parallel scan, LRU-safe absolute paths, streamed inference.
 """
 
-import os, re, sys, shutil, subprocess, time, requests, random, json
+import os, re, sys, shutil, subprocess, time, requests, random, json, metrics
 from concurrent.futures import ThreadPoolExecutor, as_completed, FIRST_COMPLETED, wait
 from functools import lru_cache
 from requests.adapters import HTTPAdapter
@@ -139,6 +139,7 @@ class RepoHunter:
                     for issue in r.json():
                         if issue.get("pull_request"):
                             continue
+                        metrics.increment_metric("issues_scanned")
                         if self._is_vague(issue.get("title", "")):
                             continue
                         if self._is_actionable(issue.get("title", ""),
@@ -160,6 +161,7 @@ class RepoHunter:
                 for issue in r.json():
                     if issue.get("pull_request"):
                         continue
+                    metrics.increment_metric("issues_scanned")
                     title = issue.get("title", "")
                     if self._is_vague(title):
                         continue
@@ -681,6 +683,7 @@ class Committer:
             if r.status_code in (200, 201):
                 pr_url = r.json().get("html_url", "")
                 log(f"[ PR ] ✓ Pull request opened: {pr_url}")
+                metrics.increment_metric("prs_opened")
                 return pr_url
             # Retry with master
             if r.status_code == 422:
@@ -698,6 +701,7 @@ class Committer:
                 if r2.status_code in (200, 201):
                     pr_url = r2.json().get("html_url", "")
                     log(f"[ PR ] ✓ Pull request opened: {pr_url}")
+                    metrics.increment_metric("prs_opened")
                     return pr_url
             log(f"[ PR ] ⚠ PR creation returned {r.status_code}: {r.text[:150]}")
             return None
@@ -891,6 +895,8 @@ class SurgicalBugSniper:
             for bug in bugs[:max_bugs]:
                 log(f"\n{'─'*62}")
                 log(f"[ BUG ] #{bug['number']}: {bug['title']}")
+
+                metrics.increment_metric("issues_attempted")
 
                 if not self.surgeon.operate(bug, repo_root):
                     subprocess.run(["git", "checkout", "."], capture_output=True)
