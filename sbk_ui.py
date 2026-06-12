@@ -195,11 +195,11 @@ def current_step() -> int:
     except Exception:
         return 0
     step = 0
-    if "[ HUNT ]"    in text: step = max(step, 1)
-    if "[ CLONE ]"   in text: step = max(step, 2)
-    if "[ SURGERY ]" in text or "[ BUG ]" in text: step = max(step, 3)
-    if "[ VERIFY ]"  in text: step = max(step, 4)
-    if "[ PUSH ]"    in text or "[ PR ]" in text: step = max(step, 5)
+    if " HUNT " in text or "[ HUNT ]" in text:     step = max(step, 1)
+    if " CLONE " in text or "[ CLONE ]" in text:   step = max(step, 2)
+    if " FIX " in text or " THINK " in text or " BUG " in text or "[ SURGERY ]" in text: step = max(step, 3)
+    if " VERIFY " in text or "[ VERIFY ]" in text: step = max(step, 4)
+    if " PUSH " in text or " PR " in text or "[ PUSH ]" in text: step = max(step, 5)
     return step
 
 
@@ -211,7 +211,7 @@ def is_done() -> bool:
 
 
 def tracker_html(step: int, running: bool) -> str:
-    STEPS = ["Hunt", "Clone", "Fixing", "Verify", "Commit"]
+    STEPS = ["Hunt", "Clone", "Analyze", "Verify", "Commit"]
     # Calculate progress width percentage (from Hunt [step 1] to Commit [step 5])
     if step <= 1:
         progress_pct = 0
