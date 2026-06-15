@@ -229,7 +229,7 @@ SURGERY_SYSTEM = """\
 You are an expert software engineer specializing in surgical code fixes. 
 Your task is to analyze the bug description and the provided file context, identify the exact root cause, and produce a SEARCH/REPLACE block to fix it.
 
-Format your output EXACTLY as shown in this block — nothing before, nothing after:
+Format your output EXACTLY as shown in this block. Output ONLY the block, with no conversational prefix, suffix, introduction, or explanations:
 <<<SEARCH>>>
 [exact lines to change, copied verbatim from the file including all whitespace and indentation]
 <<<REPLACE>>>
@@ -241,6 +241,7 @@ CRITICAL INSTRUCTIONS:
 - The <<<SEARCH>>> block must match the existing lines in the file character-for-character (same indentation, trailing spaces, and line breaks).
 - Only change what is absolutely broken to resolve the bug. Do not refactor, rewrite, add comments, or introduce unrelated imports.
 - Make the SMALLEST and most precise change possible.
+- Output ONLY raw search/replace block. Do NOT explain your changes.
 - If and ONLY if the provided file has absolutely no relation to the bug, output exactly: NO_FIX"""
 
 
@@ -417,22 +418,7 @@ class Surgeon:
         return "\n".join(lines[start:end])
 
     # ── Streamed Ollama call ──────────────────────────────────────────────────
-    def _call_ollama(self, bug_desc: str, file_path: str, file_content: str) -> str:
-        user_msg = (
-            f"Bug Report:\n{bug_desc}\n\n"
-            f"File: {file_path}\n"
-            f"```\n{file_content}\n```\n\n"
-            "Produce the SEARCH/REPLACE block to fix this bug:"
-        )
-        payload = {
-            "model":   self.model,
-            "messages": [
-                {"role": "system", "content": SURGERY_SYSTEM},
-                {"role": "user",   "content": user_msg},
-            ],
-            "stream": True,
-            "options": {"temperature": 0.05, "num_predict": 512},
-        }
+    def _call_ollama_endpoint(self, payload: dict) -> str:
         try:
             log(f"[ SURGERY ] Calling {self.model} (stream)...")
             r = self.session.post(f"{self.ollama_base}/api/chat",
@@ -463,6 +449,43 @@ class Surgeon:
         except Exception as e:
             log(f"\n[ SURGERY ] ✗ Ollama error: {e}")
             return ""
+
+    def _call_ollama(self, bug_desc: str, file_path: str, file_content: str) -> str:
+        user_msg = (
+            f"Bug Report:\n{bug_desc}\n\n"
+            f"File: {file_path}\n"
+            f"```\n{file_content}\n```\n\n"
+            "Produce the SEARCH/REPLACE block to fix this bug:"
+        )
+        payload = {
+            "model":   self.model,
+            "messages": [
+                {"role": "system", "content": SURGERY_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            "stream": True,
+            "options": {"temperature": 0.05, "num_predict": 2048},
+        }
+        return self._call_ollama_endpoint(payload)
+
+    def _call_ollama_retry(self, bug_desc: str, file_path: str, file_content: str, feedback: str) -> str:
+        user_msg = (
+            f"Bug Report:\n{bug_desc}\n\n"
+            f"File: {file_path}\n"
+            f"```\n{file_content}\n```\n\n"
+            f"Your previous SEARCH/REPLACE block failed to apply:\n{feedback}\n\n"
+            "Please produce a corrected SEARCH/REPLACE block where the SEARCH block exists in the file content character-for-character:"
+        )
+        payload = {
+            "model":   self.model,
+            "messages": [
+                {"role": "system", "content": SURGERY_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            "stream": True,
+            "options": {"temperature": 0.05, "num_predict": 2048},
+        }
+        return self._call_ollama_endpoint(payload)
 
     # ── Apply SEARCH/REPLACE with fuzzy fallback ──────────────────────────────
     def _apply_patch(self, llm_output: str, target_file: str) -> bool:
@@ -585,20 +608,38 @@ class Surgeon:
                 continue
 
             context = self._extract_context(raw, title, body)
-            llm_out = self._call_ollama(bug_desc, tf, context)
-            if not llm_out:
-                continue
 
-            if self._apply_patch(llm_out, abs_tf):
-                changed = subprocess.run(
-                    ["git", "diff", "--name-only"],
-                    capture_output=True, text=True
-                ).stdout.strip()
-                if changed:
-                    log(f"[ SURGERY ] ✓ Modified: {changed}")
-                    return True
+            # --- AGENTIC SELF-CORRECTION LOOP ---
+            attempts = 2
+            error_feedback = ""
+
+            for attempt in range(attempts):
+                if error_feedback:
+                    log(f"[ SURGERY ] Retrying {tf} (Attempt {attempt+1}/{attempts}) with error feedback...")
+                    llm_out = self._call_ollama_retry(bug_desc, tf, context, error_feedback)
                 else:
-                    log("[ SURGERY ] Patch written but git shows no diff — retrying next file")
+                    llm_out = self._call_ollama(bug_desc, tf, context)
+
+                if not llm_out:
+                    break
+
+                if self._apply_patch(llm_out, abs_tf):
+                    changed = subprocess.run(
+                        ["git", "diff", "--name-only"],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    if changed:
+                        log(f"[ SURGERY ] ✓ Modified: {changed}")
+                        return True
+                    else:
+                        log("[ SURGERY ] Patch written but git shows no diff — retrying next file")
+                        break
+                else:
+                    error_feedback = (
+                        "The SEARCH block you provided was not found in the file. "
+                        "Please make sure the SEARCH block matches the file content character-for-character, "
+                        "including all whitespace and indentation exactly."
+                    )
 
         log("[ SURGERY ] ✗ All targets exhausted")
         return False
@@ -709,7 +750,7 @@ class Committer:
             log(f"[ PR ] ⚠ Could not open PR: {e}")
             return None
 
-    def push(self, repo, bug, github_user, token, headers) -> bool:
+    def push(self, repo, bug, github_user, token, headers, user_email="sbk@sudhanwa.dev", user_name="Sudhanwa-git") -> bool:
         repo_full  = repo["full_name"]
         repo_short = repo_full.split("/")[-1]
         bug_number = bug["number"]
@@ -732,9 +773,9 @@ class Committer:
         auth_remote = fork_url.replace("https://", f"https://{github_user}:{token}@")
 
         try:
-            subprocess.run(["git", "config", "user.email", "sbk@sudhanwa.dev"],
+            subprocess.run(["git", "config", "user.email", user_email],
                            check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Sudhanwa-git"],
+            subprocess.run(["git", "config", "user.name", user_name],
                            check=True, capture_output=True)
             subprocess.run(["git", "remote", "set-url", "origin", auth_remote],
                            check=True, capture_output=True)
@@ -812,6 +853,21 @@ class SurgicalBugSniper:
                 log(f"[ INIT ] Auth failed ({r.status_code}) — push disabled")
         except Exception as e:
             log(f"[ INIT ] GitHub error: {e}")
+
+        # Get local Git email/name to ensure contributions are attributed to the user (green tiles)
+        self.user_email = "sbk@sudhanwa.dev"
+        self.user_name = "Sudhanwa-git"
+        try:
+            email_res = subprocess.run(["git", "config", "user.email"], capture_output=True, text=True)
+            if email_res.returncode == 0 and email_res.stdout.strip():
+                self.user_email = email_res.stdout.strip()
+                log(f"[ INIT ] Git email: {self.user_email}")
+            name_res = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True)
+            if name_res.returncode == 0 and name_res.stdout.strip():
+                self.user_name = name_res.stdout.strip()
+                log(f"[ INIT ] Git name: {self.user_name}")
+        except Exception:
+            pass
 
         self.hunter    = RepoHunter(self.session)
         self.cloner    = AutoCloner()
@@ -917,6 +973,8 @@ class SurgicalBugSniper:
                     github_user=self.github_user,
                     token=self.token,
                     headers=self.headers,
+                    user_email=self.user_email,
+                    user_name=self.user_name,
                 ):
                     log("\n>>> MISSION COMPLETE <<<")
                     return
