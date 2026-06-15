@@ -13,7 +13,7 @@ st.set_page_config(
     page_title="Surgical Bug Sniper",
     page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── One-time session init ─────────────────────────────────────────────────────
@@ -149,6 +149,12 @@ hr  { border-color: #222222 }
 .badge-running { background: #000000; color: #ffffff; border: 1px solid #ffffff }
 .badge-idle    { background: #000000; color: #444444; border: 1px solid #222222 }
 .badge-done    { background: #ffffff; color: #000000 }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+  background-color: #000000 !important;
+  border-right: 1px solid #222222 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -285,6 +291,36 @@ st.markdown("---")
 @st.fragment
 def live_feed():
     current_pid = st.session_state.get("process_pid")
+
+    # ── Sidebar Metrics ───────────────────────────────────────────────────────
+    import metrics
+    m = metrics.get_metrics()
+    
+    metrics_html = f"""
+    <div style="font-family: 'Michroma', sans-serif; font-size: 0.8rem; color: #ffffff; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 15px; border-bottom: 1px solid #222222; padding-bottom: 8px;">Contribution Metrics</div>
+    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
+        <span style="color: #888888;">Issues Scanned:</span>
+        <span style="color: #ffffff; font-weight: bold;">{m.get('issues_scanned', 0)}</span>
+    </div>
+    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
+        <span style="color: #888888;">Issues Attempted:</span>
+        <span style="color: #ffffff; font-weight: bold;">{m.get('issues_attempted', 0)}</span>
+    </div>
+    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
+        <span style="color: #888888;">PRs Opened:</span>
+        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_opened', 0)}</span>
+    </div>
+    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
+        <span style="color: #888888;">PRs Merged:</span>
+        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_merged', 0)}</span>
+    </div>
+    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
+        <span style="color: #888888;">PRs Closed:</span>
+        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_closed', 0)}</span>
+    </div>
+    """
+    with st.sidebar:
+        st.markdown(metrics_html, unsafe_allow_html=True)
 
     # ── Detect process death ──────────────────────────────────────────────────
     if current_pid is not None and not psutil.pid_exists(current_pid):
