@@ -13,7 +13,7 @@ st.set_page_config(
     page_title="Surgical Bug Sniper",
     page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── One-time session init ─────────────────────────────────────────────────────
@@ -150,11 +150,6 @@ hr  { border-color: #222222 }
 .badge-idle    { background: #000000; color: #444444; border: 1px solid #222222 }
 .badge-done    { background: #ffffff; color: #000000 }
 
-/* ── Sidebar ── */
-[data-testid="stSidebar"] {
-  background-color: #000000 !important;
-  border-right: 1px solid #222222 !important;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -289,42 +284,6 @@ st.markdown("---")
 #   rather than using run_every= so we can stop refreshing when idle.
 # - Only 2 DOM elements update per tick: the tracker HTML + the code block.
 @st.fragment
-def sidebar_metrics():
-    import metrics
-    m = metrics.get_metrics()
-    
-    metrics_html = f"""
-    <div style="font-family: 'Michroma', sans-serif; font-size: 0.8rem; color: #ffffff; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 15px; border-bottom: 1px solid #222222; padding-bottom: 8px;">Contribution Metrics</div>
-    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
-        <span style="color: #888888;">Issues Scanned:</span>
-        <span style="color: #ffffff; font-weight: bold;">{m.get('issues_scanned', 0)}</span>
-    </div>
-    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
-        <span style="color: #888888;">Issues Attempted:</span>
-        <span style="color: #ffffff; font-weight: bold;">{m.get('issues_attempted', 0)}</span>
-    </div>
-    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
-        <span style="color: #888888;">PRs Opened:</span>
-        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_opened', 0)}</span>
-    </div>
-    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
-        <span style="color: #888888;">PRs Merged:</span>
-        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_merged', 0)}</span>
-    </div>
-    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;">
-        <span style="color: #888888;">PRs Closed:</span>
-        <span style="color: #ffffff; font-weight: bold;">{m.get('prs_closed', 0)}</span>
-    </div>
-    """
-    st.markdown(metrics_html, unsafe_allow_html=True)
-    
-    current_pid = st.session_state.get("process_pid")
-    running = current_pid is not None
-    if running:
-        time.sleep(0.7)
-        st.rerun()
-
-@st.fragment
 def live_feed():
     current_pid = st.session_state.get("process_pid")
 
@@ -339,6 +298,23 @@ def live_feed():
 
     # ── Step tracker ──────────────────────────────────────────────────────────
     st.markdown(tracker_html(step, running), unsafe_allow_html=True)
+
+    # ── Contribution Metrics ──────────────────────────────────────────────────
+    import metrics
+    m = metrics.get_metrics()
+    metrics_html = f"""
+    <div style="border: 1px solid #222222; padding: 12px 20px; background-color: #000000; margin: 1rem 0 2rem 0;">
+        <div style="font-family: 'Michroma', sans-serif; font-size: 0.65rem; color: #ffffff; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; border-bottom: 1px solid #222222; padding-bottom: 6px;">Contribution Metrics</div>
+        <div style="display: flex; justify-content: space-between; font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 10px;">
+            <div><span style="color: #888888;">Issues Scanned:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('issues_scanned', 0)}</span></div>
+            <div><span style="color: #888888;">Issues Attempted:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('issues_attempted', 0)}</span></div>
+            <div><span style="color: #888888;">PRs Opened:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_opened', 0)}</span></div>
+            <div><span style="color: #888888;">PRs Merged:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_merged', 0)}</span></div>
+            <div><span style="color: #888888;">PRs Closed:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_closed', 0)}</span></div>
+        </div>
+    </div>
+    """
+    st.markdown(metrics_html, unsafe_allow_html=True)
 
     # ── Feed header ──────────────────────────────────────────────────────────
     badge_cls = "badge-done" if done else ("badge-running" if running else "badge-idle")
@@ -357,8 +333,5 @@ def live_feed():
         time.sleep(0.7)          # 0.7s tick — smooth without hammering CPU
         st.rerun()               # fragment-only rerun (Streamlit 1.37+)
 
-
-with st.sidebar:
-    sidebar_metrics()
 
 live_feed()
