@@ -1,6 +1,6 @@
 # Surgical Bug Sniper
 
-An autonomous AI agent that scans open-source AI repositories for bugs, generates minimal code patches using a local LLM, validates them, and opens pull requests — fully automated, zero API fees, runs on a laptop.
+An autonomous AI agent that scans open-source AI INFRA and tooling repositories for bugs, generates minimal code patches using a local LLM, validates them, and opens pull requests — fully automated, zero API fees, runs on a laptop.
 
 ---
 
