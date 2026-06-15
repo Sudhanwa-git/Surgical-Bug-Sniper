@@ -1,0 +1,9 @@
+aider-chat
+GitPython
+rich
+pytest
+python-dotenv
+requests
+urllib3
+streamlit
+psutil
