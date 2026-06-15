@@ -27,9 +27,8 @@ metrics.json
 htmlcov/
 .tox/
 
-# ── Aider (legacy dev tool) ──────────────────────────────────────────────────
-.aider.chat.history.md
-.aider.input.history
+# ── Tool Artifacts ────────────────────────────────────────────────────────────
+.aider*
 .aiderignore
 
 # ── IDE / Editor ──────────────────────────────────────────────────────────────

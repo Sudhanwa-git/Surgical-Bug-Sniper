@@ -747,12 +747,12 @@ class Surgeon:
                 search_text = m_tol.group(1)
                 replace_text = m_tol.group(2)
             else:
-                # Strategy C — Aider diff format
-                pattern_aider = r'<<<<<<< SEARCH\s*\n(.*?)\n=======\n(.*?)\n>>>>>>>'
-                m_aider = re.search(pattern_aider, llm_output, re.DOTALL)
-                if m_aider:
-                    search_text = m_aider.group(1)
-                    replace_text = m_aider.group(2)
+                # Strategy C — conflict-marker diff format
+                pattern_cm = r'<<<<<<< SEARCH\s*\n(.*?)\n=======\n(.*?)\n>>>>>>>'
+                m_cm = re.search(pattern_cm, llm_output, re.DOTALL)
+                if m_cm:
+                    search_text = m_cm.group(1)
+                    replace_text = m_cm.group(2)
 
         if not search_text and not replace_text:
             emit_fail("fix", "No valid SEARCH/REPLACE block in LLM output")
@@ -990,8 +990,7 @@ class Verifier:
 # STEP 5 — PUSH + PR
 # ═══════════════════════════════════════════════════════════════════════════════
 class Committer:
-    JUNK = {".aider.chat.history.md", ".aider.input.history",
-            ".gitignore", ".aiderignore", "sbk_run.log"}
+    JUNK = {".gitignore", "sbk_run.log", "sbk_llm.log", "metrics.json"}
 
     def __init__(self, session: requests.Session):
         self.session = session
@@ -1097,7 +1096,7 @@ class Committer:
                 f.strip() for f in diff_files
                 if f.strip()
                 and os.path.basename(f.strip()) not in self.JUNK
-                and not f.strip().startswith(".aider")
+                and not f.strip().startswith(".")
                 and os.path.isfile(f.strip())
             ]
             if not src:
@@ -1139,8 +1138,7 @@ class Committer:
 # ═══════════════════════════════════════════════════════════════════════════════
 class SurgicalBugSniper:
     def __init__(self):
-        self.model       = os.getenv("OLLAMA_MODEL",
-                           os.getenv("AIDER_MODEL", "ollama_chat/qwen2.5-coder:7b"))
+        self.model       = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
         self.ollama_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
         self.token       = os.getenv("GITHUB_TOKEN", "")
 
