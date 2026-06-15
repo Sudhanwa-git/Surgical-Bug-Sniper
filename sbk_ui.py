@@ -199,8 +199,8 @@ def current_step() -> int:
         line = line.upper()
         if " PUSH " in line or " PR " in line or "[ PUSH ]" in line: return 5
         if " VERIFY " in line or "[ VERIFY ]" in line: return 4
-        if " FIX " in line or " THINK " in line or " BUG " in line or "[ SURGERY ]" in line: return 3
-        if " CLONE " in line or "[ CLONE ]" in line: return 2
+        if " FIX " in line or " THINK " in line or " BUG " in line or " TARGET " in line: return 3
+        if " FETCH " in line or "[ FETCH ]" in line: return 2
         if " HUNT " in line or "[ HUNT ]" in line: return 1
     return 0
 
@@ -213,8 +213,8 @@ def is_done() -> bool:
 
 
 def tracker_html(step: int, running: bool) -> str:
-    STEPS = ["Hunt", "Clone", "Analyze", "Verify", "Commit"]
-    # Calculate progress width percentage (from Hunt [step 1] to Commit [step 5])
+    STEPS = ["Hunt", "Fetch", "Surgery", "Verify", "Push"]
+    # Calculate progress width percentage (from Hunt [step 1] to Push [step 5])
     if step <= 1:
         progress_pct = 0
     elif step >= 5:

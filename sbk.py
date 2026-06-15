@@ -261,64 +261,48 @@ class RepoHunter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — CLONE
+# STEP 2 — FETCH (Zero-Disk)
 # ═══════════════════════════════════════════════════════════════════════════════
-class AutoCloner:
-    def __init__(self):
-        if sys.platform == "win32":
-            self.base = "C:\\temp\\sbk_hunts"
-        else:
-            self.base = os.path.join(os.environ.get("TEMP", "/tmp"), "sbk_hunts")
-        os.makedirs(self.base, exist_ok=True)
+class MemoryLocator:
+    def __init__(self, session: requests.Session):
+        self.session = session
 
-    def _rmdir(self, path):
-        for _ in range(4):
-            try:
-                shutil.rmtree(path); return True
-            except Exception:
-                time.sleep(0.4)
-        return False
+    def get_repo_tree(self, repo_full: str) -> list:
+        emit("fetch", f"Fetching file tree for {repo_full}...")
+        for branch in ["main", "master"]:
+            r = self.session.get(f"https://api.github.com/repos/{repo_full}/git/trees/{branch}?recursive=1", timeout=15)
+            if r.status_code == 200:
+                tree = r.json().get("tree", [])
+                return [node for node in tree if node.get("type") == "blob" and node.get("path", "").endswith(".py")]
+        emit_fail("fetch", "Could not fetch git tree")
+        return []
 
-    def clone(self, repo) -> str | None:
-        url  = repo["clone_url"]
-        slug = repo["full_name"].replace("/", "_")
-        target = os.path.join(self.base, slug)
-
-        if os.path.exists(target):
-            if not self._rmdir(target) or os.path.exists(target):
-                target = os.path.join(self.base, f"{slug}_{int(time.time())}")
-
-        emit("clone", f"Fetching {repo['full_name']} (shallow blobless)...")
-        t0 = time.time()
-        try:
-            r = subprocess.run(
-                ["git", "clone", "--depth", "1", "--single-branch",
-                 "--filter=blob:none", url, target],
-                timeout=180, capture_output=True, text=True,
-                encoding="utf-8", errors="replace"
-            )
-            if r.returncode == 0:
-                elapsed = time.time() - t0
-                emit_ok("clone", f"Ready — {elapsed:.1f}s")
-                return target
-            emit_fail("clone", f"Git error: {r.stderr.strip()[:120]}")
-            return None
-        except subprocess.TimeoutExpired:
-            emit_fail("clone", "Timed out (180s)")
-            self._rmdir(target)
-            return None
+    def fetch_raw_file(self, repo_full: str, path: str) -> str:
+        # raw.githubusercontent.com/{repo_full}/main/{path}
+        for branch in ["main", "master"]:
+            r = self.session.get(f"https://raw.githubusercontent.com/{repo_full}/{branch}/{path}", timeout=10)
+            if r.status_code == 200:
+                return r.text
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — SURGERY (comprehension gate + quality validation + AI stripping)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Zero-tolerance output format — the LLM must output ONLY the patch block.
+# Zero-tolerance output format — Single-Shot Inference.
 SURGERY_SYSTEM = """\
 You are a precise code repair tool. You receive a bug report and a source file.
-You must output EXACTLY one SEARCH/REPLACE block to fix the bug.
+You must analyze the bug AND output the exact fix in a single response.
 
-OUTPUT FORMAT (no other text allowed):
+OUTPUT FORMAT:
+Line 1 MUST BE EXACTLY:
+ROOT_CAUSE: [one sentence explanation of the bug]
+If you cannot understand the bug or the file is unrelated, output exactly:
+ROOT_CAUSE: INCOMPREHENSIBLE
+(and nothing else).
+
+If you DO understand the bug, proceed immediately to output EXACTLY one SEARCH/REPLACE block:
 <<<SEARCH>>>
 [exact lines from the file, character-for-character including whitespace]
 <<<REPLACE>>>
@@ -326,36 +310,13 @@ OUTPUT FORMAT (no other text allowed):
 <<<END>>>
 
 ABSOLUTE RULES:
-1. Your ENTIRE response must begin with <<<SEARCH>>> and end with <<<END>>>
-2. Do NOT write ANY text before <<<SEARCH>>> or after <<<END>>>
-3. Do NOT add comments like "# Fixed", "# Added", "# Ensure", "# TODO"
-4. Do NOT add explanations, markdown, code fences, or conversational text
-5. Do NOT wrap code in ```python``` or any markdown blocks
-6. Do NOT refactor, rename, or restructure code beyond the fix
-7. The SEARCH block must match existing file content EXACTLY
-8. Change the FEWEST lines possible to resolve the bug
-9. If the file is unrelated to the bug, output exactly: NO_FIX
+1. Do NOT write ANY conversational text before ROOT_CAUSE or after <<<END>>>
+2. The SEARCH block must match existing file content EXACTLY
+3. Change the FEWEST lines possible to resolve the bug
+4. Do NOT wrap code in markdown fences (```)
+5. Do NOT add comments like "# Fixed"
 
-VIOLATIONS CAUSE SYSTEM FAILURE. Output ONLY the raw block."""
-
-# Lightweight comprehension prompt — asks the LLM to explain the root cause
-# before attempting a fix. If it can't, we skip (saves a wasted fix attempt).
-COMPREHENSION_PROMPT = """\
-You are a senior engineer triaging a bug report.
-Analyze the bug and respond with EXACTLY this format (one line per field):
-
-ROOT_CAUSE: [one sentence — the specific code defect causing the bug]
-AFFECTED_FUNCTION: [function or class name most likely containing the bug]
-FIX_TYPE: [one of: logic_error, missing_check, wrong_value, missing_import, type_error, api_misuse, other]
-CONFIDENCE: [high, medium, low]
-
-If you cannot determine a clear root cause, respond with exactly: INCOMPREHENSIBLE
-
-Bug Report:
-{bug_desc}
-
-Relevant file paths in the repository:
-{file_hints}"""
+VIOLATIONS CAUSE SYSTEM FAILURE."""
 
 
 class Surgeon:
@@ -386,47 +347,7 @@ class Surgeon:
             emit_fail("fix", f"Cannot reach Ollama: {e}")
             return False
 
-    # ── Comprehension Gate ────────────────────────────────────────────────────
-    def _comprehend_bug(self, bug_desc: str, file_hints: list) -> dict | None:
-        """Ask LLM to explain the root cause BEFORE attempting a fix.
-        Returns parsed comprehension dict, or None if incomprehensible."""
-        prompt = COMPREHENSION_PROMPT.format(
-            bug_desc=bug_desc[:3000],
-            file_hints=", ".join(file_hints[:5]) if file_hints else "none found"
-        )
-        payload = {
-            "model":   self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream":  False,
-            "options": {"temperature": 0.0, "num_predict": 256},
-        }
-        try:
-            r = self.session.post(f"{self.ollama_base}/api/chat",
-                                  json=payload, timeout=60)
-            if r.status_code != 200:
-                return None
-            text = r.json().get("message", {}).get("content", "")
-            _llm_log(f"\n--- COMPREHENSION ({time.strftime('%H:%M:%S')}) ---\n{text}\n")
-
-            if "INCOMPREHENSIBLE" in text.upper():
-                return None
-
-            result = {}
-            for line in text.strip().splitlines():
-                if ":" in line:
-                    key, _, val = line.partition(":")
-                    key = key.strip().upper().replace(" ", "_")
-                    if key in ("ROOT_CAUSE", "AFFECTED_FUNCTION", "FIX_TYPE", "CONFIDENCE"):
-                        result[key] = val.strip()
-
-            if not result.get("ROOT_CAUSE"):
-                return None
-            if result.get("CONFIDENCE", "").lower() == "low":
-                return None
-
-            return result
-        except Exception:
-            return None
+    # ── Comprehension gate removed — now merged with fix prompt ──────────────
 
     # ── Fetch issue comments for richer context ───────────────────────────────
     def _fetch_issue_comments(self, repo_full: str, issue_number: int) -> str:
@@ -469,87 +390,41 @@ class Surgeon:
         combined = list(dict.fromkeys(snake + [w for w in words if w not in stop]))
         return combined[:12]
 
-    # ── Parallel file content scanning ────────────────────────────────────────
-    def _find_files_by_content(self, identifiers: list, repo_root: str) -> dict:
-        scores = {}
-        if not identifiers:
-            return scores
-        try:
-            ls = subprocess.run(["git", "ls-files", "--", "*.py", "*.go", "*.rs", "*.ts", "*.js"],
-                                capture_output=True, text=True, timeout=15)
-            rel_files = [f.strip() for f in ls.stdout.splitlines() if f.strip()]
-        except Exception:
-            return scores
-
-        def _score_one(rel_path):
-            abs_path = os.path.join(repo_root, rel_path)
-            try:
-                text = _cached_read(abs_path)
-            except Exception:
-                return rel_path, 0
-            score = 0
-            for ident in identifiers:
-                score += text.count(f"def {ident}") * 6
-                score += text.count(f"fn {ident}") * 6      # Rust/Go
-                score += text.count(f"func {ident}") * 6    # Go
-                score += text.count(f"self.{ident}") * 3
-                score += text.count(f"cls.{ident}") * 3
-                score += text.count(ident)
-            return rel_path, score
-
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            futs = {pool.submit(_score_one, f): f for f in rel_files}
-            for fut in as_completed(futs):
-                rel_path, score = fut.result()
-                if score > 0:
-                    scores[rel_path] = score
-        return scores
-
-    def _find_files(self, title: str, body: str, repo_root: str) -> list:
+    def _find_files_in_tree(self, title: str, body: str, tree_nodes: list) -> list:
         found = {}
-        bug_text = title + " " + body
-
-        # Priority 1: exact traceback paths (Python File "..." lines)
+        bug_text = (title + " " + body).lower()
+        
+        # Exact traceback paths (Python File "..." lines)
+        raw_paths = []
         for raw in re.findall(r'[Ff]ile ["\'](.+?\.py)["\']', body):
-            raw_norm = raw.replace("\\", "/")
-            for root, dirs, files in os.walk("."):
-                dirs[:] = [d for d in dirs
-                           if d not in (".git","__pycache__","node_modules",".venv","dist","build")]
-                for fn in files:
-                    full = os.path.join(root, fn).replace("\\", "/")
-                    if full.endswith(raw_norm) or raw_norm.endswith(os.path.basename(fn)):
-                        found[full] = self._score_file(full, bug_text) + 20
+            raw_paths.append(raw.replace("\\", "/").lower())
+            
+        # Filenames mentioned in body
+        clean = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        names = {os.path.basename(p) for p in re.findall(r"[\w\-/]+\.(?:py|js|rs|ts|cpp|h|go)", clean)}
+        names -= {"utils.py","helpers.py","common.py","base.py","__init__.py","types.py","constants.py","config.py"}
 
-        # Priority 2: parallel content search
-        identifiers = self._extract_identifiers(title, body)
-        if identifiers:
-            content_hits = self._find_files_by_content(identifiers, repo_root)
-            for rel_path, score in content_hits.items():
-                norm = rel_path.replace("\\", "/")
-                combined = score + self._score_file(norm, bug_text)
-                found[norm] = max(found.get(norm, 0), combined)
-
-        # Priority 3: filenames mentioned in body
-        if not found:
-            clean = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
-            names = {os.path.basename(p) for p in
-                     re.findall(r"[\w\-/]+\.(?:py|js|rs|ts|cpp|h|go)", clean)}
-            names -= {"utils.py","helpers.py","common.py","base.py","__init__.py",
-                       "types.py","constants.py","config.py"}
-            for root, dirs, files in os.walk("."):
-                dirs[:] = [d for d in dirs
-                           if d not in (".git","__pycache__","node_modules",".venv")]
-                for fn in files:
-                    if fn in names:
-                        full = os.path.join(root, fn).replace("\\", "/")
-                        found[full] = self._score_file(full, bug_text) + 5
+        for node in tree_nodes:
+            path = node.get("path", "")
+            path_lower = path.lower()
+            score = self._score_file(path_lower, bug_text)
+            
+            # Boost if traceback matches
+            if any(path_lower.endswith(rp) or rp.endswith(os.path.basename(path_lower)) for rp in raw_paths):
+                score += 20
+                
+            # Boost if filename mentioned
+            if os.path.basename(path) in names:
+                score += 5
+                
+            if score > 0:
+                found[path] = score
 
         if not found:
             return []
 
         ranked = sorted(found.items(), key=lambda x: x[1], reverse=True)
-        result = [p for p, _ in ranked[:3]]
-        return result
+        return [p for p, _ in ranked[:3]]
 
     # ── Smart context window ──────────────────────────────────────────────────
     def _extract_context(self, content: str, title: str, body: str) -> str:
@@ -780,62 +655,41 @@ class Surgeon:
             text = re.sub(r'\n```$', '', text)
             return text
 
-        search_text = clean_fences(search_text)
-        replace_text = clean_fences(replace_text)
+    def _apply_patch(self, llm_response: str, original_content: str, target_file: str) -> str | None:
+        """Applies patch in memory. Returns new_content string if valid, else None."""
+        if "INCOMPREHENSIBLE" in llm_response.upper() and "ROOT_CAUSE: INCOMPREHENSIBLE" in llm_response:
+            emit_fail("fix", "LLM could not comprehend the bug — skipped")
+            return None
+            
+        if "NO_FIX" in llm_response:
+            return None
 
-        if not search_text.strip():
-            emit_fail("fix", "SEARCH block is empty after cleaning")
-            return False
+        # Extract blocks
+        blocks = re.findall(r'<<<SEARCH>>>(.*?)<<<REPLACE>>>(.*?)<<<END>>>',
+                            llm_response, re.DOTALL)
+        if not blocks:
+            emit_fail("fix", "Missing exact <<<SEARCH>>> / <<<REPLACE>>> tags")
+            return None
 
-        # ── Quality Gate — validate before writing ────────────────────────────
-        rejection = self._validate_patch_quality(search_text, replace_text)
-        if rejection:
-            emit_fail("fix", f"Patch rejected → {rejection}")
-            return False
+        search_text, replace_text = blocks[-1]
+        
+        # Clean up common LLM indentation mistakes
+        if search_text.startswith("\n"): search_text = search_text[1:]
+        if search_text.endswith("\n"):   search_text = search_text[:-1]
+        if replace_text.startswith("\n"): replace_text = replace_text[1:]
+        if replace_text.endswith("\n"):   replace_text = replace_text[:-1]
 
-        # ── Strip AI artifacts from REPLACE ───────────────────────────────────
         replace_text = self._strip_ai_artifacts(replace_text, search_text)
 
-        try:
-            original = open(target_file, encoding="utf-8", errors="replace").read()
-        except Exception as e:
-            emit_fail("fix", f"Cannot read {target_file}: {e}")
-            return False
+        error = self._validate_patch_quality(search_text, replace_text)
+        if error:
+            emit_fail("fix", f"Quality gate failed: {error}")
+            return None
 
-        # Exact match
-        new_content = None
-        match_type  = None
+        if search_text not in original_content:
+            return None
 
-        if search_text in original:
-            new_content = original.replace(search_text, replace_text, 1)
-            match_type = "exact"
-        else:
-            # Fuzzy: strip trailing whitespace per line
-            def strip_lines(s): return "\n".join(l.rstrip() for l in s.splitlines())
-            s_stripped = strip_lines(search_text)
-            o_stripped = strip_lines(original)
-            if s_stripped in o_stripped:
-                new_content = o_stripped.replace(s_stripped, replace_text.rstrip(), 1)
-                match_type = "fuzzy-ws"
-            else:
-                # Last resort: indent-agnostic
-                def strip_all(s):
-                    return "\n".join(l.strip() for l in s.splitlines() if l.strip())
-                s2 = strip_all(search_text)
-                lines_orig = original.splitlines()
-                for i, line in enumerate(lines_orig):
-                    window = "\n".join(l.strip() for l in
-                                       lines_orig[i:i+len(search_text.splitlines())] if l.strip())
-                    if window == s2:
-                        n_lines = len(search_text.splitlines())
-                        new_lines = lines_orig[:i] + replace_text.splitlines() + lines_orig[i+n_lines:]
-                        new_content = "\n".join(new_lines)
-                        match_type = "indent-agnostic"
-                        break
-
-        if new_content is None:
-            emit_fail("fix", "SEARCH block not found in file (3 strategies)")
-            return False
+        new_content = original_content.replace(search_text, replace_text, 1)
 
         # ── Pre-write AST validation for Python files ─────────────────────────
         if target_file.endswith(".py"):
@@ -878,19 +732,20 @@ class Surgeon:
         return True
 
     # ── Main surgery loop ──────────────────────────────────────────────────────
-    def operate(self, bug: dict, repo_root: str, repo_full: str = "") -> bool:
+    def operate(self, bug: dict, repo_full: str, tree_nodes: list, locator: MemoryLocator) -> dict:
+        """Returns {file_path: new_content} or {} if failed."""
         self.last_skip_reason = None
+        results = {}
 
         if not self._ollama_ok():
             self.last_skip_reason = "ollama"
-            return False
+            return results
 
-        self._repo_root = repo_root
         title = bug.get("title", "")
         body  = bug.get("body") or ""
 
         # ── Enrich context with issue comments ────────────────────────────────
-        if repo_full and bug.get("number"):
+        if bug.get("number"):
             comments_text = self._fetch_issue_comments(repo_full, bug["number"])
             if comments_text:
                 n_comments = comments_text.count("Comment by")
@@ -899,43 +754,20 @@ class Surgeon:
 
         bug_desc = f"Title: {title}\n\n{body[:3000]}"
 
-        targets = self._find_files(title, body, repo_root)
+        targets = self._find_files_in_tree(title, body, tree_nodes)
         if not targets:
-            emit_fail("target", "No candidate files found in repository")
+            emit_fail("target", "No candidate files found in repository tree")
             self.last_skip_reason = "no_files"
-            return False
+            return results
 
         target_names = [os.path.basename(t) for t in targets]
         emit("target", f"Candidates: {', '.join(target_names)}")
 
-        # ── Comprehension Gate — does the LLM understand the bug? ─────────────
-        emit("think", "Analyzing root cause before attempting fix...")
-        comprehension = self._comprehend_bug(bug_desc, targets)
-        if not comprehension:
-            emit_fail("think", "Cannot determine root cause — skipping this bug")
-            self.last_skip_reason = "comprehension"
-            return False
-
-        root_cause = comprehension.get("ROOT_CAUSE", "?")
-        confidence = comprehension.get("CONFIDENCE", "?")
-        fix_type   = comprehension.get("FIX_TYPE", "?")
-        emit_ok("think", f"{root_cause[:80]}")
-        emit("think", f"Confidence: {confidence} | Type: {fix_type}")
-
-        # Enrich bug description with the LLM's own analysis
-        bug_desc += f"\n\nRoot cause analysis: {root_cause}"
-
         for tf in targets[:3]:   # try top 3 files
-            # Resolve to absolute path for the cache
-            if not os.path.isabs(tf):
-                abs_tf = os.path.join(repo_root, tf.lstrip("./"))
-            else:
-                abs_tf = tf
-
-            try:
-                raw = _cached_read(abs_tf)
-            except Exception as e:
-                emit_fail("target", f"Cannot read {os.path.basename(abs_tf)}: {e}")
+            emit("fetch", f"Downloading {tf} into memory...")
+            raw = locator.fetch_raw_file(repo_full, tf)
+            if not raw:
+                emit_fail("target", f"Cannot fetch {os.path.basename(tf)}")
                 continue
 
             context = self._extract_context(raw, title, body)
@@ -953,65 +785,55 @@ class Surgeon:
 
                 if not llm_out:
                     break
+                    
+                # Single-Shot root cause extraction for logging
+                if "ROOT_CAUSE:" in llm_out:
+                    rc_line = [l for l in llm_out.splitlines() if l.startswith("ROOT_CAUSE:")][0]
+                    emit_ok("think", rc_line.replace("ROOT_CAUSE:", "").strip()[:80])
 
-                if self._apply_patch(llm_out, abs_tf):
-                    changed = subprocess.run(
-                        ["git", "diff", "--name-only"],
-                        capture_output=True, text=True
-                    ).stdout.strip()
-                    if changed:
-                        return True
+                new_content = self._apply_patch(llm_out, raw, tf)
+                if new_content:
+                    if new_content != raw:
+                        results[tf] = new_content
+                        return results
                     else:
-                        emit("fix", "Patch written but git shows no diff — next file")
+                        emit("fix", "Patch resulted in identical string — next file")
                         break
                 else:
                     error_feedback = (
-                        "The SEARCH block was not found in the file. "
+                        "The SEARCH block was not found in the file, or variables were undefined. "
                         "Copy the exact lines from the file character-for-character, "
                         "including all whitespace and indentation."
                     )
 
         emit_fail("fix", "All target files exhausted — no valid fix produced")
         self.last_skip_reason = "all_exhausted"
-        return False
+        return results
 
 
-# Module-level LRU cache — keyed on ABSOLUTE path to survive os.chdir()
-@lru_cache(maxsize=256)
+# Module-level LRU cache — no longer needed since we keep it in memory during run, 
+# but we leave the placeholder to avoid breaking any stray references.
 def _cached_read(abs_path: str) -> str:
-    return open(abs_path, encoding="utf-8", errors="replace").read(80000)
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — VERIFY (enhanced: py_compile + ast.parse)
 # ═══════════════════════════════════════════════════════════════════════════════
 class Verifier:
-    def run(self) -> bool:
-        emit("verify", "Running syntax + structure checks...")
-        diff = subprocess.run(["git", "diff", "--name-only"],
-                              capture_output=True, text=True)
-        py_files = [f.strip() for f in diff.stdout.strip().splitlines()
-                    if f.strip().endswith(".py") and os.path.isfile(f.strip())]
-        if not py_files:
-            emit_ok("verify", "No Python files changed")
+    def verify_in_memory(self, results: dict) -> bool:
+        emit("verify", "Running syntax + structure checks in memory...")
+        if not results:
             return True
 
         errors = []
-        for f in py_files:
-            # Check 1: py_compile
-            r = subprocess.run([sys.executable, "-m", "py_compile", f],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                errors.append(f"  {f}: {r.stderr.strip()[:200]}")
+        for file_path, new_content in results.items():
+            if not file_path.endswith(".py"):
                 continue
-
-            # Check 2: ast.parse for structural validation
             try:
-                source = open(f, encoding="utf-8", errors="replace").read()
-                tree = ast.parse(source)
+                tree = ast.parse(new_content)
             except SyntaxError as e:
-                errors.append(f"  {f}: AST parse error at line {e.lineno}")
-                continue
+                errors.append(f"  {file_path}: AST parse error at line {e.lineno}")
 
         if errors:
             emit_fail("verify", f"{len(errors)} error(s) found:")
@@ -1019,7 +841,7 @@ class Verifier:
                 print(e, flush=True)
             return False
 
-        emit_ok("verify", f"{len(py_files)} file(s) clean — syntax + AST validated")
+        emit_ok("verify", f"AST validated in memory")
         return True
 
 
@@ -1093,7 +915,7 @@ class Committer:
             emit_fail("pr", f"Could not open PR: {e}")
             return None
 
-    def push(self, repo, bug, github_user, token, headers, user_email="sbk@sudhanwa.dev", user_name="Sudhanwa-git") -> bool:
+    def push_in_memory(self, repo: dict, bug: dict, github_user: str, token: str, headers: dict, results: dict) -> bool:
         self.last_pr_url = None
         repo_full  = repo["full_name"]
         repo_short = repo_full.split("/")[-1]
@@ -1101,9 +923,12 @@ class Committer:
         bug_title  = bug.get("title", "")
         branch     = f"fix/issue-{bug_number}"
 
+        if not results:
+            emit_fail("push", "No results to commit")
+            return False
+
         emit("push", f"Forking {repo_full}...")
-        r = self.session.post(f"https://api.github.com/repos/{repo_full}/forks",
-                              headers=headers, json={}, timeout=15)
+        r = self.session.post(f"https://api.github.com/repos/{repo_full}/forks", headers=headers, json={}, timeout=15)
         if r.status_code not in [200, 202]:
             emit_fail("push", f"Fork failed ({r.status_code})")
             return False
@@ -1113,60 +938,57 @@ class Committer:
             emit_fail("push", "Fork not ready — giving up")
             return False
 
-        fork_url    = fork_data["clone_url"]
-        auth_remote = fork_url.replace("https://", f"https://{github_user}:{token}@")
-
         try:
-            subprocess.run(["git", "config", "user.email", user_email],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", user_name],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "remote", "set-url", "origin", auth_remote],
-                           check=True, capture_output=True)
-            subprocess.run(["git", "checkout", "-b", branch],
-                           check=True, capture_output=True)
+            base_branch = fork_data.get("default_branch", "main")
+            # 1. Get base branch HEAD SHA
+            r = self.session.get(f"https://api.github.com/repos/{github_user}/{repo_short}/git/refs/heads/{base_branch}", headers=headers, timeout=10)
+            if r.status_code != 200:
+                # Try master
+                base_branch = "master"
+                r = self.session.get(f"https://api.github.com/repos/{github_user}/{repo_short}/git/refs/heads/{base_branch}", headers=headers, timeout=10)
+                if r.status_code != 200:
+                    emit_fail("push", "Could not find base branch HEAD")
+                    return False
+            head_sha = r.json()["object"]["sha"]
 
-            diff_files = subprocess.run(["git", "diff", "--name-only"],
-                                        capture_output=True, text=True
-                                        ).stdout.strip().splitlines()
-            src = [
-                f.strip() for f in diff_files
-                if f.strip()
-                and os.path.basename(f.strip()) not in self.JUNK
-                and not f.strip().startswith(".")
-                and os.path.isfile(f.strip())
-            ]
-            if not src:
-                emit_fail("push", "Nothing to commit")
-                return False
+            # 2. Get commit tree SHA
+            r = self.session.get(f"https://api.github.com/repos/{github_user}/{repo_short}/git/commits/{head_sha}", headers=headers, timeout=10)
+            base_tree_sha = r.json()["tree"]["sha"]
 
-            staged = ", ".join(os.path.basename(s) for s in src)
-            emit("push", f"Staging: {staged}")
-            subprocess.run(["git", "add", "--"] + src, check=True, capture_output=True)
-            subprocess.run(
-                ["git", "commit", "-m", f"fix: resolve issue #{bug_number}"],
-                check=True, capture_output=True
-            )
-            push = subprocess.run(
-                ["git", "push", "--force", "--set-upstream", "origin", branch],
-                capture_output=True, text=True
-            )
-            if push.returncode != 0:
-                emit_fail("push", f"Push failed: {push.stderr.strip()[:200]}")
+            # 3. Create blobs for modified files
+            tree_nodes = []
+            for file_path, content in results.items():
+                r = self.session.post(f"https://api.github.com/repos/{github_user}/{repo_short}/git/blobs", headers=headers, json={"content": content, "encoding": "utf-8"}, timeout=15)
+                blob_sha = r.json()["sha"]
+                tree_nodes.append({"path": file_path, "mode": "100644", "type": "blob", "sha": blob_sha})
+
+            # 4. Create new tree
+            r = self.session.post(f"https://api.github.com/repos/{github_user}/{repo_short}/git/trees", headers=headers, json={"base_tree": base_tree_sha, "tree": tree_nodes}, timeout=15)
+            new_tree_sha = r.json()["sha"]
+
+            # 5. Create new commit
+            commit_msg = f"fix: resolve issue #{bug_number}"
+            r = self.session.post(f"https://api.github.com/repos/{github_user}/{repo_short}/git/commits", headers=headers, json={"message": commit_msg, "tree": new_tree_sha, "parents": [head_sha]}, timeout=15)
+            new_commit_sha = r.json()["sha"]
+
+            # 6. Create branch ref
+            ref_payload = {"ref": f"refs/heads/{branch}", "sha": new_commit_sha}
+            r = self.session.post(f"https://api.github.com/repos/{github_user}/{repo_short}/git/refs", headers=headers, json=ref_payload, timeout=15)
+            if r.status_code not in (201, 200):
+                emit_fail("push", f"Failed to create branch: {r.text[:100]}")
                 return False
 
             emit_ok("push", f"Branch live → {github_user}/{repo_short}/tree/{branch}")
 
-            # Open a PR automatically
-            pr_url = self._create_pr(repo_full, branch, bug_number, bug_title,
-                                     github_user, headers)
+            # 7. Open PR
+            pr_url = self._create_pr(repo_full, branch, bug_number, bug_title, github_user, headers)
             self.last_pr_url = pr_url
             if not pr_url:
                 emit("push", "Branch pushed — PR creation skipped")
             return True
 
-        except subprocess.CalledProcessError as e:
-            emit_fail("push", f"Git error: {e}")
+        except Exception as e:
+            emit_fail("push", f"API error: {e}")
             return False
 
 
@@ -1228,14 +1050,9 @@ class SurgicalBugSniper:
             "pr_url": None,
         }
 
+    # ── MemoryLocator removes need for cleanup ──
     def _cleanup(self):
-        d = self.cloner.base
-        if os.path.exists(d):
-            try:
-                shutil.rmtree(d, ignore_errors=True)
-                os.makedirs(d, exist_ok=True)
-            except Exception:
-                pass
+        pass
 
     def _parallel_scan(self, candidates: list) -> tuple:
         """
@@ -1314,6 +1131,8 @@ class SurgicalBugSniper:
         except Exception:
             pass
 
+        self.locator = MemoryLocator(self.session)
+
         candidates = WHITELIST.copy()
         random.shuffle(candidates)
         emit("init", f"Targets: {' · '.join(c.split('/')[-1] for c in candidates)}")
@@ -1327,14 +1146,10 @@ class SurgicalBugSniper:
         self.summary["repo"] = repo["full_name"]
         self.summary["bugs_scanned"] = len(bugs)
 
-        local = self.cloner.clone(repo)
-        if not local:
+        tree_nodes = self.locator.get_repo_tree(repo["full_name"])
+        if not tree_nodes:
             self._print_summary()
             return
-
-        orig = os.getcwd()
-        os.chdir(local)
-        repo_root = local   # absolute — passed to surgeon so LRU cache stays valid
 
         max_bugs = int(os.getenv("MAX_BUGS_PER_REPO", "3"))
 
@@ -1347,9 +1162,8 @@ class SurgicalBugSniper:
                 metrics.increment_metric("issues_attempted")
                 self.summary["bugs_attempted"] += 1
 
-                if not self.surgeon.operate(bug, repo_root, repo_full=repo["full_name"]):
-                    subprocess.run(["git", "checkout", "."], capture_output=True)
-                    # Track skip reason
+                results = self.surgeon.operate(bug, repo["full_name"], tree_nodes, self.locator)
+                if not results:
                     reason = self.surgeon.last_skip_reason
                     if reason == "comprehension":
                         self.summary["skipped_comprehension"] += 1
@@ -1357,29 +1171,22 @@ class SurgicalBugSniper:
                         self.summary["skipped_no_fix"] += 1
                     continue
 
-                if not self.verifier.run():
-                    subprocess.run(["git", "checkout", "."], capture_output=True)
+                if not self.verifier.verify_in_memory(results):
                     self.summary["skipped_verify"] += 1
                     continue
 
-                # Record what was fixed
-                diff_output = subprocess.run(
-                    ["git", "diff", "--name-only"],
-                    capture_output=True, text=True
-                ).stdout.strip()
-                self.summary["fix_file"] = diff_output.replace("\n", ", ")
+                self.summary["fix_file"] = ", ".join(results.keys())
 
                 if not self.github_user:
                     emit_fail("push", "No GitHub auth — cannot push")
                     continue
 
-                if self.committer.push(
+                if self.committer.push_in_memory(
                     repo=repo, bug=bug,
                     github_user=self.github_user,
                     token=self.token,
                     headers=self.headers,
-                    user_email=self.user_email,
-                    user_name=self.user_name,
+                    results=results,
                 ):
                     self.summary["pr_url"] = self.committer.last_pr_url or "pushed (no PR)"
                     print(flush=True)
@@ -1389,8 +1196,6 @@ class SurgicalBugSniper:
 
         except Exception as e:
             emit_fail("error", str(e))
-        finally:
-            os.chdir(orig)
 
         emit("done", "All bugs tried — no fix committed this run")
         self._print_summary()
