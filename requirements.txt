@@ -1,9 +1,5 @@
-aider-chat
-GitPython
-rich
-pytest
 python-dotenv
 requests
 urllib3
-streamlit
+streamlit>=1.37
 psutil
