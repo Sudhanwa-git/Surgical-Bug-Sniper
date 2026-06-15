@@ -191,16 +191,18 @@ def current_step() -> int:
     if not os.path.exists(LOG_FILE):
         return 0
     try:
-        text = open(LOG_FILE, encoding="utf-8", errors="replace").read()
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
     except Exception:
         return 0
-    step = 0
-    if " HUNT " in text or "[ HUNT ]" in text:     step = max(step, 1)
-    if " CLONE " in text or "[ CLONE ]" in text:   step = max(step, 2)
-    if " FIX " in text or " THINK " in text or " BUG " in text or "[ SURGERY ]" in text: step = max(step, 3)
-    if " VERIFY " in text or "[ VERIFY ]" in text: step = max(step, 4)
-    if " PUSH " in text or " PR " in text or "[ PUSH ]" in text: step = max(step, 5)
-    return step
+    for line in reversed(lines):
+        line = line.upper()
+        if " PUSH " in line or " PR " in line or "[ PUSH ]" in line: return 5
+        if " VERIFY " in line or "[ VERIFY ]" in line: return 4
+        if " FIX " in line or " THINK " in line or " BUG " in line or "[ SURGERY ]" in line: return 3
+        if " CLONE " in line or "[ CLONE ]" in line: return 2
+        if " HUNT " in line or "[ HUNT ]" in line: return 1
+    return 0
 
 
 def is_done() -> bool:

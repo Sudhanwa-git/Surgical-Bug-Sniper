@@ -252,9 +252,9 @@ class RepoHunter:
             except Exception:
                 pass
 
-        # Rank by difficulty — easiest first, filter out hopeless ones
+        # Rank by difficulty — strictly NO BS bugs (must have explicit error or traceback)
         bugs.sort(key=lambda b: self._score_difficulty(b), reverse=True)
-        bugs = [b for b in bugs if self._score_difficulty(b) > 0]
+        bugs = [b for b in bugs if self._score_difficulty(b) >= 20]
 
         emit("hunt", f"Scanned {repo_full_name} → {len(bugs)} solvable bug(s)")
         return bugs[:5]
