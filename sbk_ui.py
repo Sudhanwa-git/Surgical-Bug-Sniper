@@ -4,7 +4,7 @@ Streamlit 1.37+ · Fragment-scoped live refresh · Zero full-page rerenders duri
 """
 
 import streamlit as st
-import subprocess, os, sys, time, re, psutil
+import subprocess, os, sys, time, re, psutil, collections
 from dotenv import load_dotenv, dotenv_values
 
 load_dotenv(override=True)
@@ -158,15 +158,20 @@ ANSI = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 LOG_FILE = "sbk_run.log"
 
 
-def get_logs(n: int = 100) -> str:
+def _tail_log(n: int) -> list:
     if not os.path.exists(LOG_FILE):
-        return "No active feed."
+        return []
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-n:]
-        return "".join(ANSI.sub("", l) for l in lines) or "Initializing..."
+            return list(collections.deque(f, maxlen=n))
     except Exception:
-        return "Error reading log."
+        return []
+
+def get_logs(n: int = 100) -> str:
+    lines = _tail_log(n)
+    if not lines:
+        return "No active feed."
+    return "".join(ANSI.sub("", l) for l in lines) or "Initializing..."
 
 
 def kill_hunt():
@@ -188,33 +193,25 @@ def kill_hunt():
 
 
 def current_step() -> int:
-    if not os.path.exists(LOG_FILE):
-        return 0
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except Exception:
-        return 0
+    lines = _tail_log(300)
     for line in reversed(lines):
         line = line.upper()
         if " PUSH " in line or " PR " in line or "[ PUSH ]" in line: return 5
         if " VERIFY " in line or "[ VERIFY ]" in line: return 4
-        if " FIX " in line or " THINK " in line or " BUG " in line or " TARGET " in line: return 3
-        if " FETCH " in line or "[ FETCH ]" in line: return 2
+        if " FIX " in line or " THINK " in line or " BUG " in line or "[ SURGERY ]" in line: return 3
+        if " CLONE " in line or "[ CLONE ]" in line: return 2
         if " HUNT " in line or "[ HUNT ]" in line: return 1
     return 0
 
 
 def is_done() -> bool:
-    try:
-        return "MISSION COMPLETE" in open(LOG_FILE, encoding="utf-8", errors="replace").read()
-    except Exception:
-        return False
+    lines = _tail_log(100)
+    return any("MISSION COMPLETE" in line for line in lines)
 
 
 def tracker_html(step: int, running: bool) -> str:
-    STEPS = ["Hunt", "Fetch", "Surgery", "Verify", "Push"]
-    # Calculate progress width percentage (from Hunt [step 1] to Push [step 5])
+    STEPS = ["Hunt", "Clone", "Analyze", "Verify", "Commit"]
+    # Calculate progress width percentage (from Hunt [step 1] to Commit [step 5])
     if step <= 1:
         progress_pct = 0
     elif step >= 5:
