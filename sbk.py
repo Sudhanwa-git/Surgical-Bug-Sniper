@@ -688,6 +688,20 @@ class Surgeon:
         if len(search_lines) < 1:
             return "SEARCH block is empty"
 
+        # Reject identical patch (wasting time)
+        if search_text.strip() == replace_text.strip():
+            return "REPLACE is identical to SEARCH (no changes made)"
+
+        # Reject debug prints
+        if "print(" in replace_text and "print(" not in search_text:
+            return "REPLACE introduces debug print() statements"
+
+        # Reject lazy 'pass' blocks replacing actual logic
+        rep_code = "\n".join(l for l in replace_lines if not l.strip().startswith("#")).strip()
+        src_code = "\n".join(l for l in search_lines if not l.strip().startswith("#")).strip()
+        if rep_code in ("pass", "return", "return None") and src_code not in ("pass", "return", "return None", ""):
+            return "REPLACE deletes logic and leaves only 'pass' or 'return'"
+
         # Reject if REPLACE is dramatically larger (LLM is rewriting, not fixing)
         max_allowed = max(len(search_lines) * 3, 12)
         if len(replace_lines) > max_allowed:
@@ -826,7 +840,30 @@ class Surgeon:
         # ── Pre-write AST validation for Python files ─────────────────────────
         if target_file.endswith(".py"):
             try:
-                ast.parse(new_content)
+                old_tree = ast.parse(original)
+                new_tree = ast.parse(new_content)
+                
+                # Deep validation: Check for hallucinated/undefined variables
+                def get_loaded_names(tree):
+                    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+                def get_defined_names(tree):
+                    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+                    names.update({node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef))})
+                    names.update({alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names})
+                    return names
+
+                old_loaded = get_loaded_names(old_tree)
+                new_loaded = get_loaded_names(new_tree)
+                new_defined = get_defined_names(new_tree)
+                builtins = set(dir(__builtins__)) | {'self', 'cls', 'args', 'kwargs', '_'}
+                
+                newly_loaded = new_loaded - old_loaded
+                hallucinated = newly_loaded - new_defined - builtins
+                
+                if hallucinated:
+                    emit_fail("fix", f"Patch introduces undefined variables: {', '.join(hallucinated)} — rejected pre-write")
+                    return False
+
             except SyntaxError as e:
                 emit_fail("fix", f"Patch would break syntax at line {e.lineno} — rejected pre-write")
                 return False
