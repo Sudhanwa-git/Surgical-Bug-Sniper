@@ -15,23 +15,36 @@ echo.
 
 git add -A
 if errorlevel 1 (
-    echo   FAILED: git add
+    echo.
+    echo   ✗ UNSUCCESSFUL
+    echo   Reason: git add failed
+    echo   ──────────────────────────────────────────────────
+    echo.
     exit /b 1
 )
 
 git commit -m "%~1"
 if errorlevel 1 (
-    echo   FAILED: git commit (nothing to commit?)
+    echo.
+    echo   ✗ UNSUCCESSFUL
+    echo   Reason: nothing to commit, or commit failed
+    echo   ──────────────────────────────────────────────────
+    echo.
     exit /b 1
 )
 
 git push origin main
 if errorlevel 1 (
-    echo   FAILED: git push — check remote and auth
+    echo.
+    echo   ✗ UNSUCCESSFUL
+    echo   Reason: push failed — check remote and auth
+    echo   ──────────────────────────────────────────────────
+    echo.
     exit /b 1
 )
 
 echo.
-echo   SHIPPED: "%~1"
+echo   ✓ SUCCESSFUL
+echo   Committed: "%~1"
 echo   ──────────────────────────────────────────────────
 echo.

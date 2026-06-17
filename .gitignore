@@ -20,6 +20,7 @@ env/
 sbk_run.log
 sbk_llm.log
 metrics.json
+attempted_issues.json
 
 # ── Test / Coverage ───────────────────────────────────────────────────────────
 .pytest_cache/
