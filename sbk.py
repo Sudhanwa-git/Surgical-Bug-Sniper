@@ -6,7 +6,7 @@ v9: Lean. Zero-disk. No subprocess. No git clone.
     GitHub Tree API → in-memory patch + AST guard → GitHub Data API commit.
 """
 
-import os, re, sys, time, requests, random, json, ast, metrics
+import os, re, sys, time, requests, random, json, ast, metrics, pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -92,13 +92,27 @@ def _make_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=3, backoff_factor=0.4,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],   # 429 handled manually below
         allowed_methods=["GET", "POST"], raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=30)
     s.mount("https://", adapter)
     s.mount("http://",  adapter)
     return s
+
+
+def _gh_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """GET with automatic Retry-After respect for GitHub 429 / secondary rate limits."""
+    for attempt in range(3):
+        r = session.get(url, **kwargs)
+        if r.status_code == 429 or (r.status_code == 403 and
+                                    "rate limit" in r.text.lower()):
+            wait = int(r.headers.get("Retry-After", 60))
+            emit("rate", f"GitHub rate-limited — waiting {wait}s (attempt {attempt+1}/3)")
+            time.sleep(wait)
+            continue
+        return r
+    return r  # return last response after exhausting retries
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,9 +124,13 @@ class RepoHunter:
 
     def get_repo(self, name: str) -> dict | None:
         try:
-            r = self.session.get(f"https://api.github.com/repos/{name}", timeout=10)
+            r = _gh_get(self.session, f"https://api.github.com/repos/{name}", timeout=10)
             if r.status_code == 200:
-                return {"full_name": r.json()["full_name"]}
+                data = r.json()
+                return {
+                    "full_name":      data["full_name"],
+                    "default_branch": data.get("default_branch", "main"),
+                }
         except Exception:
             pass
         return None
@@ -165,7 +183,7 @@ class RepoHunter:
         # Strategy A — labelled
         for label in BUG_LABELS:
             try:
-                r = self.session.get(
+                r = _gh_get(self.session,
                     f"https://api.github.com/repos/{repo_full}/issues"
                     f"?state=open&labels={label}&per_page=20&sort=created&direction=desc",
                     timeout=10)
@@ -184,7 +202,7 @@ class RepoHunter:
         # Strategy B — unlabelled fallback
         if not bugs:
             try:
-                r = self.session.get(
+                r = _gh_get(self.session,
                     f"https://api.github.com/repos/{repo_full}/issues"
                     f"?state=open&per_page=30&sort=created&direction=desc",
                     timeout=10)
@@ -212,11 +230,17 @@ class FileLocator:
         self.session = session
         self._tree_cache: dict[str, list] = {}
 
-    def get_tree(self, repo_full: str) -> list:
+    def get_tree(self, repo_full: str, default_branch: str = "") -> list:
         if repo_full in self._tree_cache:
             return self._tree_cache[repo_full]
-        for branch in ("main", "master"):
-            r = self.session.get(
+        # Use the repo's actual default branch first, then fall back
+        branches = ([default_branch] if default_branch else []) + ["main", "master"]
+        seen = set()
+        for branch in branches:
+            if branch in seen:
+                continue
+            seen.add(branch)
+            r = _gh_get(self.session,
                 f"https://api.github.com/repos/{repo_full}/git/trees/{branch}?recursive=1",
                 timeout=15)
             if r.status_code == 200:
@@ -291,7 +315,7 @@ class Surgeon:
 
     def _fetch_comments(self, repo_full: str, issue_num: int) -> str:
         try:
-            r = self.session.get(
+            r = _gh_get(self.session,
                 f"https://api.github.com/repos/{repo_full}/issues/{issue_num}/comments"
                 f"?per_page=5&sort=created&direction=asc",
                 timeout=10)
@@ -685,13 +709,13 @@ class Committer:
             base_branch = fork.get("default_branch", "main")
 
             # HEAD SHA
-            r = self.session.get(
+            r = _gh_get(self.session,
                 f"https://api.github.com/repos/{github_user}/{repo_short}"
                 f"/git/refs/heads/{base_branch}",
                 headers=headers, timeout=10)
             if r.status_code != 200:
                 base_branch = "master"
-                r = self.session.get(
+                r = _gh_get(self.session,
                     f"https://api.github.com/repos/{github_user}/{repo_short}"
                     f"/git/refs/heads/{base_branch}",
                     headers=headers, timeout=10)
@@ -705,6 +729,9 @@ class Committer:
                 f"https://api.github.com/repos/{github_user}/{repo_short}"
                 f"/git/commits/{head_sha}",
                 headers=headers, timeout=10)
+            if r.status_code != 200:
+                emit_fail("push", f"Cannot fetch commit {head_sha[:8]}: HTTP {r.status_code}")
+                return False
             base_tree_sha = r.json()["tree"]["sha"]
 
             # Blobs → tree
@@ -715,6 +742,9 @@ class Committer:
                     headers=headers,
                     json={"content": content, "encoding": "utf-8"},
                     timeout=20)
+                if rb.status_code not in (200, 201):
+                    emit_fail("push", f"Blob creation failed for {file_path}: HTTP {rb.status_code}")
+                    return False
                 tree_items.append({"path": file_path, "mode": "100644",
                                    "type": "blob", "sha": rb.json()["sha"]})
 
@@ -723,6 +753,9 @@ class Committer:
                 headers=headers,
                 json={"base_tree": base_tree_sha, "tree": tree_items},
                 timeout=15)
+            if rt.status_code not in (200, 201):
+                emit_fail("push", f"Tree creation failed: HTTP {rt.status_code}")
+                return False
             new_tree_sha = rt.json()["sha"]
 
             # Commit
@@ -732,6 +765,9 @@ class Committer:
                 json={"message": f"fix: resolve issue #{bug_number}",
                       "tree": new_tree_sha, "parents": [head_sha]},
                 timeout=15)
+            if rc.status_code not in (200, 201):
+                emit_fail("push", f"Commit creation failed: HTTP {rc.status_code}")
+                return False
             new_commit_sha = rc.json()["sha"]
 
             # Branch ref
@@ -756,6 +792,31 @@ class Committer:
             return False
 
 
+# ── Attempted-issues cache ────────────────────────────────────────────────────
+_CACHE_FILE = pathlib.Path(__file__).parent / "attempted_issues.json"
+
+def _load_cache() -> set:
+    try:
+        return set(json.loads(_CACHE_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+def _save_cache(cache: set):
+    try:
+        _CACHE_FILE.write_text(json.dumps(sorted(cache)), encoding="utf-8")
+    except Exception:
+        pass
+
+def _mark_attempted(repo_full: str, issue_num: int):
+    key = f"{repo_full}#{issue_num}"
+    cache = _load_cache()
+    cache.add(key)
+    _save_cache(cache)
+
+def _already_attempted(repo_full: str, issue_num: int) -> bool:
+    return f"{repo_full}#{issue_num}" in _load_cache()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -764,6 +825,7 @@ class SurgicalBugSniper:
         self.model       = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
         self.ollama_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
         self.token       = os.getenv("GITHUB_TOKEN", "")
+        self.dry_run     = os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes")
 
         self.session = _make_session()
         self.session.headers.update({
@@ -805,7 +867,8 @@ class SurgicalBugSniper:
             return repo, self.hunter.scan_bugs(repo["full_name"])
 
         results = []
-        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        max_workers = min(len(candidates), 8)   # cap thread pool — don't spin up unbounded threads
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for repo, bugs in [f.result() for f in as_completed(
                     [pool.submit(_fetch, n) for n in candidates])]:
                 if repo and bugs:
@@ -846,7 +909,7 @@ class SurgicalBugSniper:
         print(flush=True)
 
         try:
-            open(LLM_LOG, "w").close()
+            open(LLM_LOG, "w", encoding="utf-8").close()  # fix: always specify encoding
         except Exception:
             pass
 
@@ -863,7 +926,8 @@ class SurgicalBugSniper:
         self.summary["repo"] = repo["full_name"]
         self.summary["bugs_scanned"] = len(bugs)
 
-        tree = self.locator.get_tree(repo["full_name"])
+        tree = self.locator.get_tree(repo["full_name"],
+                                     default_branch=repo.get("default_branch", ""))
         if not tree:
             emit_fail("fetch", "Cannot fetch repo tree")
             self._print_summary()
@@ -871,14 +935,26 @@ class SurgicalBugSniper:
 
         max_bugs = int(os.getenv("MAX_BUGS_PER_REPO", "3"))
 
+        if self.dry_run:
+            emit("dry-run", "DRY_RUN=true — will hunt/fix but NOT fork/push/PR")
+
         try:
             for bug in bugs[:max_bugs]:
                 print(flush=True)
-                emit("bug", f"#{bug['number']}: {bug['title'][:65]}")
+                issue_id = bug['number']
+                repo_full = repo["full_name"]
+
+                # Skip if we've already attempted this issue in a previous run
+                if _already_attempted(repo_full, issue_id):
+                    emit("hunt", f"#{issue_id} already attempted in a prior run — skipping")
+                    continue
+
+                emit("bug", f"#{issue_id}: {bug['title'][:65]}")
                 metrics.increment_metric("issues_attempted")
                 self.summary["bugs_attempted"] += 1
+                _mark_attempted(repo_full, issue_id)  # mark before attempt to avoid re-runs on crash
 
-                results = self.surgeon.operate(bug, repo["full_name"], tree, self.locator)
+                results = self.surgeon.operate(bug, repo_full, tree, self.locator)
                 if not results:
                     reason = self.surgeon.last_skip_reason
                     self.summary["skipped_comprehension" if reason == "comprehension" else "skipped_no_fix"] += 1
@@ -889,6 +965,13 @@ class SurgicalBugSniper:
                     continue
 
                 self.summary["fix_file"] = ", ".join(results.keys())
+
+                if self.dry_run:
+                    emit_ok("dry-run", f"Fix verified. Skipping push (DRY_RUN). Files: {self.summary['fix_file']}")
+                    print(flush=True)
+                    emit_ok("done", "MISSION COMPLETE (dry run)")
+                    self._print_summary()
+                    return
 
                 if not self.github_user:
                     emit_fail("push", "No GitHub auth — cannot push")

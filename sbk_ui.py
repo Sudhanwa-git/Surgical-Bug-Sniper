@@ -250,7 +250,8 @@ pid = st.session_state.get("process_pid")
 with col_btn:
     if pid is None:
         if st.button("▶  FIRE", key="hunt_btn"):
-            open(LOG_FILE, "w", encoding="utf-8").write("DEPLOYING...\n")
+            with open(LOG_FILE, "w", encoding="utf-8") as _f:
+                _f.write("DEPLOYING...\n")
             fresh_env = {
                 **os.environ,
                 **dotenv_values(".env"),
