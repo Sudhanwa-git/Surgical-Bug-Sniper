@@ -4,8 +4,9 @@ Streamlit 1.37+ · Fragment-scoped live refresh · Zero full-page rerenders duri
 """
 
 import streamlit as st
-import subprocess, os, sys, time, re, psutil, collections
+import subprocess, os, sys, time, re, psutil, collections, requests
 from dotenv import load_dotenv, dotenv_values
+import db
 
 load_dotenv(override=True)
 
@@ -21,6 +22,7 @@ if "session_started" not in st.session_state:
     st.session_state.session_started = True
     st.session_state.process_pid     = None
     st.session_state.last_log_hash   = ""
+    db.init_db()   # ensure sniper.db + tables exist on first load
     try:
         open("sbk_run.log", "w", encoding="utf-8").close()
     except Exception:
@@ -299,24 +301,74 @@ def live_feed():
     # ── Step tracker ──────────────────────────────────────────────────────────
     st.markdown(tracker_html(step, running), unsafe_allow_html=True)
 
-    # ── Contribution Metrics ──────────────────────────────────────────────────
-    import metrics
-    m = metrics.get_metrics()
+    # ── Contribution Metrics (from SQLite db) ───────────────────────────────
+    m = db.get_stats()
+    import metrics as _m
+    mc = _m.get_metrics()   # still read issues_scanned from metrics.json
+    win_color = "#00ff88" if m["win_rate"] > 50 else ("#ffaa00" if m["win_rate"] > 0 else "#888888")
     metrics_html = f"""
-    <div style="border: 1px solid #222222; padding: 12px 20px; background-color: #000000; margin: 1rem 0 2rem 0;">
+    <div style="border: 1px solid #222222; padding: 12px 20px; background-color: #000000; margin: 1rem 0 1.2rem 0;">
         <div style="font-family: 'Michroma', sans-serif; font-size: 0.65rem; color: #ffffff; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; border-bottom: 1px solid #222222; padding-bottom: 6px;">Contribution Metrics</div>
         <div style="display: flex; justify-content: space-between; font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 10px;">
-            <div><span style="color: #888888;">Issues Scanned:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('issues_scanned', 0)}</span></div>
-            <div><span style="color: #888888;">Issues Attempted:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('issues_attempted', 0)}</span></div>
-            <div><span style="color: #888888;">PRs Opened:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_opened', 0)}</span></div>
-            <div><span style="color: #888888;">PRs Merged:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_merged', 0)}</span></div>
-            <div><span style="color: #888888;">PRs Closed:</span> <span style="color: #ffffff; font-weight: bold;">{m.get('prs_closed', 0)}</span></div>
+            <div><span style="color: #888888;">Issues Scanned:</span> <span style="color: #ffffff; font-weight: bold;">{mc.get('issues_scanned', 0)}</span></div>
+            <div><span style="color: #888888;">Issues Attempted:</span> <span style="color: #ffffff; font-weight: bold;">{mc.get('issues_attempted', 0)}</span></div>
+            <div><span style="color: #888888;">PRs Opened:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_opened']}</span></div>
+            <div><span style="color: #888888;">PRs Merged:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_merged']}</span></div>
+            <div><span style="color: #888888;">PRs Closed:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_closed']}</span></div>
+            <div><span style="color: #888888;">Win Rate:</span> <span style="color: {win_color}; font-weight: bold;">{m['win_rate']}%</span></div>
+            <div><span style="color: #888888;">Total Runs:</span> <span style="color: #ffffff; font-weight: bold;">{m['total_runs']}</span></div>
         </div>
     </div>
     """
     st.markdown(metrics_html, unsafe_allow_html=True)
 
+    # ── PR Outcome Tracker ────────────────────────────────────────────────────
+    open_prs = db.pr_open_list()
+    all_recent = m.get("recent_prs", [])
+    if all_recent:
+        col_pr_hdr, col_refresh = st.columns([5, 1])
+        with col_pr_hdr:
+            st.markdown(
+                f'<p class="feed-label">PR Outcome Tracker'
+                f'<span class="status-badge badge-idle">{len(open_prs)} OPEN</span></p>',
+                unsafe_allow_html=True)
+        with col_refresh:
+            if st.button("🔄  Poll", key="poll_btn", help="Check GitHub for latest PR status"):
+                token = os.getenv("GITHUB_TOKEN", "")
+                for pr in open_prs:
+                    try:
+                        api_url = pr["pr_url"].replace(
+                            "github.com", "api.github.com/repos"
+                        ).replace("/pull/", "/pulls/")
+                        r = requests.get(api_url,
+                            headers={"Authorization": f"token {token}",
+                                     "Accept": "application/vnd.github.v3+json"},
+                            timeout=10)
+                        if r.status_code == 200:
+                            data   = r.json()
+                            merged = data.get("merged", False)
+                            state  = data.get("state", "open")
+                            if merged:
+                                db.pr_update(pr["pr_url"], "merged",
+                                             data.get("merged_at", ""))
+                            elif state == "closed":
+                                db.pr_update(pr["pr_url"], "closed")
+                    except Exception:
+                        pass
+                st.rerun()
+
+        STATE_ICON = {"open": "⏳", "merged": "✅", "closed": "❌"}
+        rows = []
+        for p in all_recent:
+            icon  = STATE_ICON.get(p["state"], "")
+            repo_short = p["pr_url"].split("github.com/")[-1].split("/pull/")[0]
+            rows.append(
+                f"{icon} [{repo_short}#{p['pr_number']}]({p['pr_url']}) "
+                f"— issue #{p['issue_number']} — **{p['state']}**")
+        st.markdown("\n\n".join(rows))
+
     # ── Feed header ──────────────────────────────────────────────────────────
+
     badge_cls = "badge-done" if done else ("badge-running" if running else "badge-idle")
     badge_txt = "COMPLETE" if done else ("RUNNING" if running else "IDLE")
     st.markdown(

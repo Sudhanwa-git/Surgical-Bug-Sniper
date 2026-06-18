@@ -6,7 +6,8 @@ v9: Lean. Zero-disk. No subprocess. No git clone.
     GitHub Tree API → in-memory patch + AST guard → GitHub Data API commit.
 """
 
-import os, re, sys, time, requests, random, json, ast, metrics, pathlib
+import os, re, sys, time, requests, random, json, ast, metrics, pathlib, db
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -358,7 +359,53 @@ class Surgeon:
             if score > 0:
                 found[path] = score
 
-        return [p for p, _ in sorted(found.items(), key=lambda x: x[1], reverse=True)[:3]]
+        return [p for p, _ in sorted(found.items(), key=lambda x: x[1], reverse=True)[:5]]
+
+    def _semantic_rerank(self, candidates: list, bug_desc: str,
+                         repo_full: str, locator: "FileLocator") -> list:
+        """
+        Re-rank candidate files using Ollama embedding cosine similarity.
+        Only active when USE_EMBEDDINGS=true.  Falls back gracefully on any error.
+        Adds ~1-2s but dramatically improves file targeting accuracy.
+        """
+        if not candidates:
+            return candidates
+        if os.getenv("USE_EMBEDDINGS", "false").lower() not in ("1", "true", "yes"):
+            return candidates[:3]   # default: return top-3 keyword candidates unchanged
+
+        embed_model = os.getenv("EMBED_MODEL", "nomic-embed-text")
+
+        def _embed(text: str) -> list:
+            try:
+                r = self.session.post(
+                    f"{self.ollama_base}/api/embeddings",
+                    json={"model": embed_model, "prompt": text[:4000]},
+                    timeout=30)
+                if r.status_code == 200:
+                    return r.json().get("embedding", [])
+            except Exception:
+                pass
+            return []
+
+        bug_vec = _embed(bug_desc)
+        if not bug_vec:
+            emit("embed", "Embedding unavailable — using keyword ranking")
+            return candidates[:3]
+
+        scored = []
+        for path in candidates:
+            content = locator.fetch(repo_full, path)
+            if not content:
+                continue
+            vec = _embed(content[:4000])
+            sim = db._cosine(bug_vec, vec)
+            scored.append((path, sim))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        reranked = [p for p, _ in scored[:3]]
+        if reranked:
+            emit_ok("embed", f"Semantic rerank → {', '.join(os.path.basename(p) for p in reranked)}")
+        return reranked or candidates[:3]
 
     def _extract_context(self, content: str, title: str, body: str) -> str:
         if len(content) <= self.ctx_chars:
@@ -570,13 +617,15 @@ class Surgeon:
                 body += "\n\n--- Discussion ---\n" + ctx
 
         bug_desc = f"Title: {title}\n\n{body[:3000]}"
-        targets  = self._find_targets(title, body, tree)
+        kw_targets = self._find_targets(title, body, tree)
 
-        if not targets:
+        if not kw_targets:
             emit_fail("target", "No candidate files found")
             self.last_skip_reason = "no_files"
             return {}
 
+        # Semantic re-ranking (fast no-op unless USE_EMBEDDINGS=true)
+        targets = self._semantic_rerank(kw_targets, bug_desc, repo_full, locator)
         emit("target", f"Candidates: {', '.join(os.path.basename(t) for t in targets)}")
 
         for tf in targets:
@@ -606,6 +655,19 @@ class Surgeon:
 
                 new = self._apply_mem(llm_out, raw, tf)
                 if new is not None:
+                    # Record match details to DB
+                    mt = "exact"
+                    m_exact = (new != raw and llm_out)
+                    try:
+                        import re as _re
+                        m2 = RE_SEARCH_REPLACE.search(llm_out)
+                        s_block = m2.group(1).strip() if m2 else ""
+                        sl = len(s_block.splitlines())
+                        rl = len(new.splitlines()) - len(raw.splitlines()) + sl
+                        db.patch_done(repo_full, bug.get("number", 0),
+                                      patch_file=tf, lines_before=sl, lines_after=max(rl,0))
+                    except Exception:
+                        pass
                     return {tf: new}
                 feedback = "SEARCH not found. Copy exact lines including all whitespace."
 
@@ -684,6 +746,24 @@ class Committer:
                 return None
         return None
 
+    def _has_existing_pr(self, repo_full: str, issue_num: int, headers: dict) -> bool:
+        """Return True if any open PR already references this issue — avoids duplicate PRs."""
+        try:
+            r = self.session.get(
+                f"https://api.github.com/repos/{repo_full}/pulls?state=open&per_page=50",
+                headers=headers, timeout=10)
+            if r.status_code != 200:
+                return False
+            pattern = re.compile(rf'\b#{issue_num}\b')
+            for pr in r.json():
+                combined = (pr.get("body") or "") + pr.get("title", "")
+                if pattern.search(combined):
+                    emit("push", f"Existing open PR already covers #{issue_num} — skipping")
+                    return True
+        except Exception:
+            pass
+        return False
+
     def push(self, repo: dict, bug: dict, github_user: str,
              token: str, headers: dict, results: dict) -> bool:
         self.last_pr_url = None
@@ -691,6 +771,10 @@ class Committer:
         repo_short = repo_full.split("/")[-1]
         bug_number = bug["number"]
         branch     = f"fix/issue-{bug_number}"
+
+        # Pre-PR duplicate check — don't open a PR if one already exists for this issue
+        if self._has_existing_pr(repo_full, bug_number, headers):
+            return False
 
         # Fork
         emit("push", f"Forking {repo_full}...")
@@ -785,6 +869,15 @@ class Committer:
             pr_url = self._create_pr(repo_full, branch, bug_number,
                                      bug.get("title",""), github_user, headers)
             self.last_pr_url = pr_url
+
+            # Extract PR number from URL for DB tracking
+            if pr_url:
+                try:
+                    pr_num = int(pr_url.rstrip("/").split("/")[-1])
+                    db.pr_add(pr_url, repo_full, bug_number, pr_num)
+                except Exception:
+                    pass
+
             return True
 
         except Exception as e:
@@ -792,31 +885,9 @@ class Committer:
             return False
 
 
-# ── Attempted-issues cache ────────────────────────────────────────────────────
-_CACHE_FILE = pathlib.Path(__file__).parent / "attempted_issues.json"
-
-def _load_cache() -> set:
-    try:
-        return set(json.loads(_CACHE_FILE.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
-def _save_cache(cache: set):
-    try:
-        _CACHE_FILE.write_text(json.dumps(sorted(cache)), encoding="utf-8")
-    except Exception:
-        pass
-
-def _mark_attempted(repo_full: str, issue_num: int):
-    key = f"{repo_full}#{issue_num}"
-    cache = _load_cache()
-    cache.add(key)
-    _save_cache(cache)
-
-def _already_attempted(repo_full: str, issue_num: int) -> bool:
-    return f"{repo_full}#{issue_num}" in _load_cache()
-
-
+# ── Attempted-issues cache (now delegated to db.py) ─────────────────────────
+# The JSON-file cache functions have been replaced by db.already_attempted()
+# and db.mark_attempted(). The db module is imported at the top of this file.
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -901,6 +972,11 @@ class SurgicalBugSniper:
         print(" ═══════════════════════════════════════════════════════════", flush=True)
 
     def run(self):
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        t_start = time.time()
+        db.init_db()
+        db.run_start(run_id)
+
         print(flush=True)
         print(" ═══════════════════════════════════════════════════════════", flush=True)
         print("  SURGICAL BUG SNIPER  v9  ·  Zero-Disk · Quality-First", flush=True)
@@ -945,14 +1021,15 @@ class SurgicalBugSniper:
                 repo_full = repo["full_name"]
 
                 # Skip if we've already attempted this issue in a previous run
-                if _already_attempted(repo_full, issue_id):
+                if db.already_attempted(repo_full, issue_id):
                     emit("hunt", f"#{issue_id} already attempted in a prior run — skipping")
                     continue
 
                 emit("bug", f"#{issue_id}: {bug['title'][:65]}")
                 metrics.increment_metric("issues_attempted")
                 self.summary["bugs_attempted"] += 1
-                _mark_attempted(repo_full, issue_id)  # mark before attempt to avoid re-runs on crash
+                db.mark_attempted(repo_full, issue_id,   # mark before attempt — avoids re-runs on crash
+                                  title=bug.get("title",""), run_id=run_id)
 
                 results = self.surgeon.operate(bug, repo_full, tree, self.locator)
                 if not results:
@@ -980,6 +1057,13 @@ class SurgicalBugSniper:
                 if self.committer.push(repo=repo, bug=bug, github_user=self.github_user,
                                        token=self.token, headers=self.headers, results=results):
                     self.summary["pr_url"] = self.committer.last_pr_url or "pushed (no PR)"
+                    db.patch_done(repo_full, issue_id, pr_url=self.committer.last_pr_url)
+                    db.run_finish(run_id, outcome="success",
+                                  repo=repo_full,
+                                  duration_sec=round(time.time()-t_start, 1),
+                                  bugs_scanned=len(bugs),
+                                  bugs_attempted=self.summary["bugs_attempted"],
+                                  pr_url=self.committer.last_pr_url)
                     print(flush=True)
                     emit_ok("done", "MISSION COMPLETE")
                     self._print_summary()
@@ -987,7 +1071,14 @@ class SurgicalBugSniper:
 
         except Exception as e:
             emit_fail("error", str(e))
+            db.run_finish(run_id, outcome="error",
+                          duration_sec=round(time.time()-t_start, 1))
 
+        db.run_finish(run_id, outcome="no_fix",
+                      repo=repo.get("full_name") if repo else None,
+                      duration_sec=round(time.time()-t_start, 1),
+                      bugs_scanned=len(bugs) if bugs else 0,
+                      bugs_attempted=self.summary["bugs_attempted"])
         emit("done", "All bugs tried — no fix committed this run")
         self._print_summary()
 

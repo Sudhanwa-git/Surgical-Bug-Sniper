@@ -21,6 +21,7 @@ sbk_run.log
 sbk_llm.log
 metrics.json
 attempted_issues.json
+sniper.db
 
 # ── Test / Coverage ───────────────────────────────────────────────────────────
 .pytest_cache/
