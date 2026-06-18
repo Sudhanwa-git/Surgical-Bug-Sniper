@@ -146,7 +146,6 @@ The agent currently scans:
 - `ollama/ollama`
 - `vllm-project/vllm`
 
----
 
 ## Limitations
 
