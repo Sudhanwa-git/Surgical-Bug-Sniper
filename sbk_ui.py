@@ -128,6 +128,31 @@ html, body, [class*="css"] { background: #000000 !important }
 .abort-btn > button:hover { background: #ffffff; color: #000000 }
 
 /* ── Log Feed ── */
+.feed-wrap {
+  background: #000000;
+  border: 1px solid #222222;
+  padding: 14px 16px;
+  max-height: 620px;
+  overflow-y: auto;
+  font-family: 'Share Tech Mono', 'Courier New', monospace;
+  font-size: .72rem;
+  line-height: 1.55;
+  scroll-behavior: smooth;
+}
+.ll-base  { display:block; white-space:pre-wrap; word-break:break-all; padding: 1px 0; }
+.ll-ok    { color: #4ade80; }   /* green  — success */
+.ll-fail  { color: #f87171; }   /* red    — failure */
+.ll-think { color: #fbbf24; }   /* amber  — LLM reasoning */
+.ll-patch { color: #a78bfa; }   /* violet — patch summary */
+.ll-diff-hdr  { color: #60a5fa; padding: 3px 0 1px 0; }  /* blue — diff box header/footer */
+.ll-diff-rem  { color: #f87171; background: #1c0a0a; display:block; white-space:pre-wrap; padding:0 4px; }
+.ll-diff-add  { color: #4ade80; background: #071c0f; display:block; white-space:pre-wrap; padding:0 4px; }
+.ll-diff-ctx  { color: #555555; display:block; white-space:pre-wrap; padding:0 4px; }
+.ll-info  { color: #888888; }   /* grey   — neutral info */
+.ll-ts    { color: #333333; }   /* dimmed — timestamps */
+.ll-phase { color: #ffffff; font-weight: bold; margin-right: 4px; }
+.ll-sep   { color: #333333; display:block; }
+
 .stCodeBlock, pre {
   background: #000000 !important;
   border: 1px solid #222222; border-radius: 0;
@@ -169,11 +194,122 @@ def _tail_log(n: int) -> list:
     except Exception:
         return []
 
-def get_logs(n: int = 100) -> str:
-    lines = _tail_log(n)
+
+def _esc(text: str) -> str:
+    """HTML-escape a string."""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+# ── Phase colour mapping ──────────────────────────────────────────────────────
+_PHASE_CLASS = {
+    "HUNT"  : "ll-ok",
+    "TARGET": "ll-ok",
+    "FETCH" : "ll-info",
+    "FIX"   : "ll-ok",
+    "THINK" : "ll-think",
+    "PATCH" : "ll-patch",
+    "DIFF"  : "ll-diff-hdr",
+    "VERIFY": "ll-ok",
+    "PUSH"  : "ll-ok",
+    "PR"    : "ll-ok",
+    "EMBED" : "ll-info",
+    "INIT"  : "ll-info",
+    "BUG"   : "ll-think",
+    "RATE"  : "ll-fail",
+    "DONE"  : "ll-ok",
+    "DRY-RUN": "ll-think",
+    "ABORT" : "ll-fail",
+    "ERROR" : "ll-fail",
+}
+
+# Lines whose phase should force red styling regardless of ✓/✗
+_ALWAYS_FAIL = {"RATE", "ABORT", "ERROR"}
+
+
+def _render_line(raw: str) -> str:
+    """
+    Convert one log line into a styled HTML span.
+    Handles:
+      • Normal emit lines:  " PHASE    [sym] [HH:MM:SS] message"
+      • DIFF box lines:     " DIFF      │ - old code" / " DIFF      │ + new code"
+      • DIFF borders:       " DIFF      ┌─..."
+      • PATCH summary:      " PATCH      ✎  [file]  ..."
+      • Section separators: "═" or "─"
+    """
+    line = ANSI.sub("", raw).rstrip("\n\r")
+    if not line.strip():
+        return "<br>"
+
+    # ─── Section separator lines ────────────────────────────────────
+    if line.strip().startswith("═") or line.strip().startswith("─"):
+        return f'<span class="ll-sep ll-base">{_esc(line)}</span>'
+
+    # ─── DIFF box lines ────────────────────────────────────────
+    if " DIFF " in line:
+        # Header / footer of the box  (┌─ filename  OR  └─────)
+        if "┌" in line or "└" in line or ("│" in line and " - " not in line and " + " not in line):
+            return f'<span class="ll-diff-hdr ll-base">{_esc(line)}</span>'
+        # Removed line
+        if "│ -" in line:
+            code = _esc(line.split("│ -", 1)[1]) if "│ -" in line else _esc(line)
+            return f'<span class="ll-diff-rem">  − {code}</span>'
+        # Added line
+        if "│ +" in line:
+            code = _esc(line.split("│ +", 1)[1]) if "│ +" in line else _esc(line)
+            return f'<span class="ll-diff-add">  + {code}</span>'
+        # Context / ellipsis
+        return f'<span class="ll-diff-ctx">{_esc(line)}</span>'
+
+    # ─── Standard emit line: " PHASE    sym [ts] msg" ────────────────────────
+    # Strip leading space, split on whitespace up to 3 tokens: PHASE, SYM, rest
+    stripped = line.lstrip()
+    parts    = stripped.split(None, 2)       # ["PHASE", "sym_or_[ts]", "rest..."]
+    if len(parts) < 2:
+        return f'<span class="ll-info ll-base">{_esc(line)}</span>'
+
+    phase = parts[0].rstrip(":")
+    rest  = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    # Extract timestamp [HH:MM:SS] if present
+    ts_html = ""
+    ts_match = re.match(r"([✓✗ ]?)\s*(\[\d{2}:\d{2}:\d{2}\])\s*(.*)", rest, re.DOTALL)
+    if ts_match:
+        sym, ts, msg = ts_match.group(1), ts_match.group(2), ts_match.group(3)
+        ts_html = f'<span class="ll-ts">{_esc(ts)} </span>'
+    else:
+        sym_match = re.match(r"([✓✗ ]?)\s*(.*)", rest, re.DOTALL)
+        sym = sym_match.group(1) if sym_match else " "
+        msg = sym_match.group(2) if sym_match else rest
+
+    # Choose colour class
+    if sym == "✓" and phase not in _ALWAYS_FAIL:
+        cls = "ll-ok"
+    elif sym == "✗" or phase in _ALWAYS_FAIL:
+        cls = "ll-fail"
+    else:
+        cls = _PHASE_CLASS.get(phase, "ll-info")
+
+    sym_html = f'<span style="margin-right:4px">{_esc(sym)}</span>' if sym.strip() else ""
+    phase_html = f'<span class="ll-phase" style="min-width:54px;display:inline-block">{_esc(phase)}</span>'
+    msg_html   = f'<span class="{cls}">{_esc(msg)}</span>'
+
+    return f'<span class="ll-base">{phase_html} {sym_html}{ts_html}{msg_html}</span>'
+
+
+def render_feed_html(lines: list) -> str:
+    """Turn the full list of log lines into a scrollable styled HTML block."""
     if not lines:
-        return "No active feed."
-    return "".join(ANSI.sub("", l) for l in lines) or "Initializing..."
+        return '<div class="feed-wrap"><span class="ll-info">No active feed.</span></div>'
+    inner = "\n".join(_render_line(l) for l in lines)
+    # Auto-scroll anchor
+    return (
+        f'<div class="feed-wrap" id="log-feed">{inner}'
+        f'<span id="feed-bottom"></span></div>'
+        f'<script>document.getElementById("feed-bottom")?.scrollIntoView({{behavior:"smooth"}});</script>'
+    )
 
 
 def kill_hunt():
@@ -194,8 +330,7 @@ def kill_hunt():
             pass
 
 
-def current_step() -> int:
-    lines = _tail_log(300)
+def current_step(lines: list) -> int:
     for line in reversed(lines):
         line = line.upper()
         if " PUSH " in line or " PR " in line or "[ PUSH ]" in line: return 5
@@ -206,8 +341,7 @@ def current_step() -> int:
     return 0
 
 
-def is_done() -> bool:
-    lines = _tail_log(100)
+def is_done(lines: list) -> bool:
     return any("MISSION COMPLETE" in line for line in lines)
 
 
@@ -295,8 +429,10 @@ def live_feed():
         st.rerun(scope="app")   # full page rerun once to swap ABORT → FIRE button
 
     running  = current_pid is not None
-    step     = current_step()
-    done     = is_done()
+    # Single file-read per tick: feed all helpers from this one list
+    log_lines = _tail_log(300)
+    step     = current_step(log_lines)
+    done     = is_done(log_lines)
 
     # ── Step tracker ──────────────────────────────────────────────────────────
     st.markdown(tracker_html(step, running), unsafe_allow_html=True)
@@ -378,11 +514,11 @@ def live_feed():
     )
 
     # ── Log ───────────────────────────────────────────────────────────────────
-    st.code(get_logs(), language="bash")
+    st.markdown(render_feed_html(log_lines), unsafe_allow_html=True)
 
-    # ── Self-refresh while running ────────────────────────────────────────────
+    # ── Self-refresh while running ─────────────────────────────────────────────
     if running:
-        time.sleep(0.7)          # 0.7s tick — smooth without hammering CPU
+        time.sleep(0.7)          # 0.7s tick ─ smooth without hammering CPU
         st.rerun()               # fragment-only rerun (Streamlit 1.37+)
 
 

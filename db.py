@@ -184,10 +184,13 @@ def get_stats() -> dict:
 
 # ── Cosine similarity (no numpy needed) ──────────────────────────────────────
 
-def _cosine(a: list[float], b: list[float]) -> float:
+def _cosine(a: list[float], b: list[float],
+            mag_a: float | None = None) -> float:
+    """Cosine similarity.  Pass pre-computed mag_a to avoid re-calculating it
+    when comparing a fixed query vector against many document vectors."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(y * y for y in b))
+    dot   = math.fsum(x * y for x, y in zip(a, b))
+    mag_a = mag_a if mag_a is not None else math.sqrt(math.fsum(x * x for x in a))
+    mag_b = math.sqrt(math.fsum(y * y for y in b))
     return dot / (mag_a * mag_b) if (mag_a and mag_b) else 0.0

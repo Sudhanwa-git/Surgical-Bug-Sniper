@@ -7,7 +7,7 @@ v9: Lean. Zero-disk. No subprocess. No git clone.
 """
 
 import os, re, sys, time, requests, random, json, ast, metrics, pathlib, db
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -24,10 +24,55 @@ load_dotenv(override=True)
 LLM_LOG = "sbk_llm.log"
 
 def emit(phase: str, msg: str, sym: str = " "):
-    print(f" {phase.upper():<8} {sym} {msg}", flush=True)
+    ts = time.strftime("%H:%M:%S")
+    print(f" {phase.upper():<8} {sym} [{ts}] {msg}", flush=True)
 
 def emit_ok(phase, msg):   emit(phase, msg, "✓")
 def emit_fail(phase, msg): emit(phase, msg, "✗")
+
+def emit_diff(search: str, replace: str, path: str):
+    """Write a compact, human-readable diff block to the live log."""
+    fname = os.path.basename(path)
+    s_lines = search.strip().splitlines()
+    r_lines = replace.strip().splitlines()
+
+    # Show at most 8 lines on each side to keep feed readable
+    MAX = 8
+    s_show = s_lines[:MAX]
+    r_show = r_lines[:MAX]
+    s_more = len(s_lines) - len(s_show)
+    r_more = len(r_lines) - len(r_show)
+
+    print(f" DIFF      ┌─ {fname} ─────────────────────────────", flush=True)
+    for line in s_show:
+        print(f" DIFF      │ - {line}", flush=True)
+    if s_more:
+        print(f" DIFF      │   ... ({s_more} more line(s) removed)", flush=True)
+    print(f" DIFF      │", flush=True)
+    for line in r_show:
+        print(f" DIFF      │ + {line}", flush=True)
+    if r_more:
+        print(f" DIFF      │   ... ({r_more} more line(s) added)", flush=True)
+    print(f" DIFF      └─────────────────────────────────────────", flush=True)
+
+
+def emit_patch_summary(path: str, search: str, replace: str, match_type: str):
+    """One-liner human summary + full diff block."""
+    fname  = os.path.basename(path)
+    s_lines = [l for l in search.strip().splitlines() if l.strip()]
+    r_lines = [l for l in replace.strip().splitlines() if l.strip()]
+    removed = len(s_lines)
+    added   = len(r_lines)
+
+    if added > removed:
+        action = f"added {added - removed} line(s)"
+    elif removed > added:
+        action = f"removed {removed - added} line(s)"
+    else:
+        action = f"rewrote {removed} line(s)"
+
+    print(f" PATCH      ✎  [{fname}]  {action}  (match: {match_type})", flush=True)
+    emit_diff(search, replace, path)
 
 def _llm_log(text: str):
     try:
@@ -38,16 +83,22 @@ def _llm_log(text: str):
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# Python-only AI repos with responsive maintainers & active community PRs
 WHITELIST = [
     "langchain-ai/langgraph",
+    "BerriAI/litellm",          # high issue throughput, quick merges
     "joaomdmoura/crewAI",
     "run-llama/llama_index",
-    "qdrant/qdrant",
-    "ollama/ollama",
     "vllm-project/vllm",
+    "microsoft/autogen",
 ]
 
-BUG_LABELS = ["bug", "Bug", "type:bug", "kind/bug", "bug report"]
+# Maintainer-blessed labels — these signal "we WANT a PR for this"
+PREFERRED_LABELS = ["good first issue", "help wanted", "good-first-issue", "help-wanted"]
+BUG_LABELS       = ["bug", "Bug", "type:bug", "kind/bug", "bug report"]
+
+# Issue age sweet spot: not too fresh (maintainer on it), not abandoned
+AGE_MIN_DAYS, AGE_MAX_DAYS = 7, 365
 
 _STOP = frozenset({
     "the","and","for","with","that","this","from","are","has","not",
@@ -86,7 +137,8 @@ RE_SEARCH_REPLACE = re.compile(r'<<<SEARCH>>>\s*\n?(.*?)\n?<<<REPLACE>>>\s*\n?(.
 RE_SEARCH_REPLACE_FALLBACK = re.compile(
     r'(?:\*?\*?SEARCH\*?\*?:?\s*\n?)(.*?)(?:\n?\*?\*?REPLACE\*?\*?:?\s*\n?)'
     r'(.*?)(?:\n?<<<END>>>|\n?```|\Z)', re.DOTALL | re.IGNORECASE)
-RE_FILE_TB = re.compile(r'[Ff]ile ["\'](.+?\.py)["\']')
+RE_TEST_BLOCK  = re.compile(r'<<<TEST>>>\s*\n?(.*?)\n?<<<END_TEST>>>', re.DOTALL)
+RE_FILE_TB     = re.compile(r'[Ff]ile ["\'](.+?\.py)["\']')
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
 def _make_session() -> requests.Session:
@@ -116,9 +168,9 @@ def _gh_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
     return r  # return last response after exhausting retries
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — HUNT
-# ═══════════════════════════════════════════════════════════════════════════════
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# STEP 1 \u2014 HUNT + TRIAGE
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 class RepoHunter:
     def __init__(self, session: requests.Session):
         self.session = session
@@ -135,6 +187,23 @@ class RepoHunter:
         except Exception:
             pass
         return None
+
+    # ── Triage helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _issue_age_ok(issue: dict) -> bool:
+        """Return True if issue is in the age sweet-spot (not too fresh, not abandoned)."""
+        try:
+            dt  = datetime.fromisoformat(issue["created_at"].replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - dt).days
+            return AGE_MIN_DAYS <= age <= AGE_MAX_DAYS
+        except Exception:
+            return True   # don't penalise if unparseable
+
+    @staticmethod
+    def _is_unclaimed(issue: dict) -> bool:
+        """Skip issues already assigned to someone — maintainer has it."""
+        return issue.get("assignee") is None
 
     @staticmethod
     def _is_actionable(title: str, body: str) -> bool:
@@ -162,45 +231,71 @@ class RepoHunter:
 
     @staticmethod
     def _score(issue: dict) -> int:
-        title = issue.get("title", "")
-        body  = issue.get("body") or ""
+        title    = issue.get("title", "")
+        body     = issue.get("body") or ""
+        labels   = [l.get("name","").lower() for l in issue.get("labels", [])]
         combined = (title + " " + body).lower()
-        score = 0
+        score    = 0
+        # Maintainer-blessed labels are a strong positive signal
+        if any(l in ("good first issue","help wanted","good-first-issue","help-wanted")
+               for l in labels):
+            score += 15
         if RE_FILE_LINE.search(combined): score += 30
-        if RE_EXC_TYPES.search(body): score += 20
+        if RE_EXC_TYPES.search(body):     score += 20
         if RE_CODE_ELEM.search(combined): score += 10
-        if "```" in body: score += 10
-        if len(body) < 2000: score += 5
+        if "```" in body:                 score += 10
+        if len(body) < 2000:              score += 5
         for sig in _HARD_SIGNALS:
-            if sig in combined:
-                score -= 25
+            if sig in combined:           score -= 25
         if len(set(RE_FILE_EXT.findall(body))) > 3: score -= 15
-        if issue.get("comments", 0) > 10: score -= 20
+        if issue.get("comments", 0) > 10:           score -= 20
         if "pull request" in combined or RE_PR.search(combined): score -= 10
         return score
 
-    def scan_bugs(self, repo_full: str) -> list:
-        bugs = []
-        # Strategy A — labelled
-        for label in BUG_LABELS:
-            try:
-                r = _gh_get(self.session,
-                    f"https://api.github.com/repos/{repo_full}/issues"
-                    f"?state=open&labels={label}&per_page=20&sort=created&direction=desc",
-                    timeout=10)
-                if r.status_code == 200:
-                    for issue in r.json():
-                        if not issue.get("pull_request") and \
-                           not self._is_vague(issue.get("title","")) and \
-                           self._is_actionable(issue.get("title",""), issue.get("body") or ""):
-                            metrics.increment_metric("issues_scanned")
-                            bugs.append(issue)
-                    if bugs:
-                        break
-            except Exception:
-                continue
+    def _fetch_label(self, repo_full: str, label: str) -> list:
+        """Fetch issues for a single label — used by parallel scanner."""
+        try:
+            r = _gh_get(self.session,
+                f"https://api.github.com/repos/{repo_full}/issues"
+                f"?state=open&labels={label}&per_page=20&sort=created&direction=desc",
+                timeout=10)
+            if r.status_code == 200:
+                found = []
+                for issue in r.json():
+                    if (not issue.get("pull_request")
+                            and self._is_unclaimed(issue)
+                            and self._issue_age_ok(issue)
+                            and not self._is_vague(issue.get("title",""))
+                            and self._is_actionable(issue.get("title",""),
+                                                     issue.get("body") or "")):
+                        metrics.increment_metric("issues_scanned")
+                        found.append(issue)
+                return found
+        except Exception:
+            pass
+        return []
 
-        # Strategy B — unlabelled fallback
+    def scan_bugs(self, repo_full: str) -> list:
+        bugs: list   = []
+        seen_ids: set[int] = set()
+
+        def _collect(labels: list):
+            with ThreadPoolExecutor(max_workers=len(labels)) as pool:
+                for fut in as_completed([pool.submit(self._fetch_label, repo_full, lbl)
+                                         for lbl in labels]):
+                    for issue in fut.result():
+                        if issue["id"] not in seen_ids:
+                            seen_ids.add(issue["id"])
+                            bugs.append(issue)
+
+        # Round 1 — maintainer-blessed labels (best merge signal)
+        _collect(PREFERRED_LABELS)
+
+        # Round 2 — generic bug labels if nothing preferred found
+        if not bugs:
+            _collect(BUG_LABELS)
+
+        # Round 3 — unlabelled fallback
         if not bugs:
             try:
                 r = _gh_get(self.session,
@@ -209,9 +304,12 @@ class RepoHunter:
                     timeout=10)
                 if r.status_code == 200:
                     for issue in r.json():
-                        if not issue.get("pull_request") and \
-                           not self._is_vague(issue.get("title","")) and \
-                           self._is_actionable(issue.get("title",""), issue.get("body") or ""):
+                        if (not issue.get("pull_request")
+                                and self._is_unclaimed(issue)
+                                and self._issue_age_ok(issue)
+                                and not self._is_vague(issue.get("title",""))
+                                and self._is_actionable(issue.get("title",""),
+                                                         issue.get("body") or "")):
                             metrics.increment_metric("issues_scanned")
                             bugs.append(issue)
             except Exception:
@@ -219,8 +317,28 @@ class RepoHunter:
 
         bugs = [b for b in bugs if self._score(b) >= 20]
         bugs.sort(key=self._score, reverse=True)
-        emit("hunt", f"Scanned {repo_full} → {len(bugs)} solvable bug(s)")
+        emit("hunt", f"Scanned {repo_full} \u2192 {len(bugs)} solvable bug(s)")
         return bugs[:5]
+
+
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def get_repo(self, name: str) -> dict | None:
+        try:
+            r = _gh_get(self.session, f"https://api.github.com/repos/{name}", timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "full_name":      data["full_name"],
+                    "default_branch": data.get("default_branch", "main"),
+                }
+        except Exception:
+            pass
+        return None
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -230,6 +348,7 @@ class FileLocator:
     def __init__(self, session: requests.Session):
         self.session = session
         self._tree_cache: dict[str, list] = {}
+        self._branch_cache: dict[str, str] = {}   # repo_full → resolved branch
 
     def get_tree(self, repo_full: str, default_branch: str = "") -> list:
         if repo_full in self._tree_cache:
@@ -247,16 +366,22 @@ class FileLocator:
             if r.status_code == 200:
                 nodes = [n["path"] for n in r.json().get("tree", []) if n.get("type") == "blob"]
                 self._tree_cache[repo_full] = nodes
+                self._branch_cache[repo_full] = branch   # remember working branch
                 return nodes
         emit_fail("fetch", f"Cannot fetch tree for {repo_full}")
         return []
 
     def fetch(self, repo_full: str, path: str) -> str:
-        for branch in ("main", "master"):
+        # Try the known-good branch first (avoids a wasted HTTP round-trip)
+        known = self._branch_cache.get(repo_full)
+        branches = ([known] if known else []) + [b for b in ("main", "master") if b != known]
+        for branch in branches:
             r = self.session.get(
                 f"https://raw.githubusercontent.com/{repo_full}/{branch}/{path}",
                 timeout=15)
             if r.status_code == 200:
+                if branch != known:          # cache the newly discovered branch
+                    self._branch_cache[repo_full] = branch
                 return r.text[:100_000]
         return ""
 
@@ -351,13 +476,23 @@ class Surgeon:
                       "types.py","constants.py","config.py"}
 
         found = {}
+        tb_hits = []   # fast path: collect traceback hits immediately
         for path in tree:
             name = os.path.basename(path).lower()
-            score = self._score_path(path, kws)
-            if name in tb_names:     score += 20
-            elif name in mentioned:  score += 5
-            if score > 0:
-                found[path] = score
+            if name in tb_names:
+                tb_hits.append(path)
+                found[path] = 20 + self._score_path(path, kws)
+            else:
+                score = self._score_path(path, kws)
+                if name in mentioned:
+                    score += 5
+                if score > 0:
+                    found[path] = score
+
+        # Short-circuit: if we have high-confidence traceback hits, skip low-signal candidates
+        if len(tb_hits) >= 2:
+            tb_hits.sort(key=lambda p: found[p], reverse=True)
+            return tb_hits[:5]
 
         return [p for p, _ in sorted(found.items(), key=lambda x: x[1], reverse=True)[:5]]
 
@@ -392,13 +527,17 @@ class Surgeon:
             emit("embed", "Embedding unavailable — using keyword ranking")
             return candidates[:3]
 
+        # Precompute query magnitude once — reused for every file comparison
+        import math as _math
+        bug_mag = _math.sqrt(_math.fsum(x * x for x in bug_vec)) if bug_vec else 0.0
+
         scored = []
         for path in candidates:
             content = locator.fetch(repo_full, path)
             if not content:
                 continue
             vec = _embed(content[:4000])
-            sim = db._cosine(bug_vec, vec)
+            sim = db._cosine(bug_vec, vec, mag_a=bug_mag)
             scored.append((path, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -596,6 +735,8 @@ class Surgeon:
 
         sn, rn = len(s.strip().splitlines()), len(r.strip().splitlines())
         emit_ok("fix", f"Patched {os.path.basename(path)} ({mt}, {sn}→{rn} lines)")
+        # Emit a human-readable diff so the live feed shows exactly what changed
+        emit_patch_summary(path, s, r, mt)
         return new
 
     def operate(self, bug: dict, repo_full: str,
@@ -651,15 +792,12 @@ class Surgeon:
                         emit_fail("think", "LLM cannot comprehend — skipping")
                         self.last_skip_reason = "comprehension"
                         break
-                    emit_ok("think", rc[:80])
+                    emit_ok("think", f"Root cause → {rc[:120]}")
 
                 new = self._apply_mem(llm_out, raw, tf)
                 if new is not None:
                     # Record match details to DB
-                    mt = "exact"
-                    m_exact = (new != raw and llm_out)
                     try:
-                        import re as _re
                         m2 = RE_SEARCH_REPLACE.search(llm_out)
                         s_block = m2.group(1).strip() if m2 else ""
                         sl = len(s_block.splitlines())
