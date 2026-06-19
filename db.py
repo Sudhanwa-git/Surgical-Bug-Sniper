@@ -50,6 +50,9 @@ def init_db():
                 lines_before  INTEGER,
                 lines_after   INTEGER,
                 pr_url        TEXT,
+                root_cause    TEXT,           -- extracted root cause sentence from LLM
+                files_changed TEXT,           -- comma-separated relative paths
+                fix_lines     INTEGER,        -- net lines changed (after - before)
                 attempted_at  TEXT    NOT NULL,
                 UNIQUE(repo, issue_number)
             );
@@ -65,6 +68,17 @@ def init_db():
                 merged_at     TEXT
             );
             """)
+
+        # Non-destructive migration for existing DBs that lack the new columns
+        with _conn() as c:
+            existing = {row[1] for row in c.execute("PRAGMA table_info(patches)")}
+            for col, typedef in [
+                ("root_cause",    "TEXT"),
+                ("files_changed", "TEXT"),
+                ("fix_lines",     "INTEGER"),
+            ]:
+                if col not in existing:
+                    c.execute(f"ALTER TABLE patches ADD COLUMN {col} {typedef}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -153,6 +167,100 @@ def pr_update(pr_url: str, state: str, merged_at: str = ""):
                    SET state=?, merged_at=?, last_polled=?
                    WHERE pr_url=?""",
                 (state, merged_at, _now(), pr_url))
+
+
+# ── Learning: merge patterns ─────────────────────────────────────────────────
+
+_MIN_OUTCOMES = 20   # minimum resolved PRs before patterns are injected
+
+
+def get_merge_patterns(repo_full: str | None = None) -> str:
+    """
+    Query SQLite for merge-rate patterns (global + per-repo).
+    Returns a compact one-block string ready for prompt injection, or "" if
+    fewer than _MIN_OUTCOMES resolved (merged/closed) PRs exist in the DB.
+
+    Pure SQL — no LLM call, executes in <2ms.
+    """
+    with _conn() as c:
+        resolved = c.execute(
+            "SELECT COUNT(*) FROM pr_outcomes WHERE state IN ('merged','closed')"
+        ).fetchone()[0]
+
+        if resolved < _MIN_OUTCOMES:
+            return ""  # not enough data yet — stay silent
+
+        # ── Global patterns: merge rate by root-cause category ────────────────
+        rows = c.execute("""
+            SELECT p.root_cause,
+                   COUNT(*)                                         AS total,
+                   SUM(CASE WHEN o.state='merged' THEN 1 ELSE 0 END) AS merged
+            FROM patches p
+            JOIN pr_outcomes o ON o.pr_url = p.pr_url
+            WHERE p.root_cause IS NOT NULL AND p.root_cause != ''
+              AND o.state IN ('merged', 'closed')
+            GROUP BY p.root_cause
+            HAVING total >= 2
+            ORDER BY (merged * 1.0 / total) DESC
+            LIMIT 5
+        """).fetchall()
+
+        global_lines = []
+        for row in rows:
+            rate = round(row["merged"] / row["total"] * 100)
+            # Only surface patterns worth acting on (>40% merge rate)
+            if rate >= 40:
+                global_lines.append(f"{row['root_cause'][:60]} ({rate}% merged)")
+
+        # ── Per-repo patterns (only if repo_full provided) ────────────────────
+        repo_lines = []
+        if repo_full:
+            rrows = c.execute("""
+                SELECT p.root_cause,
+                       COUNT(*)                                         AS total,
+                       SUM(CASE WHEN o.state='merged' THEN 1 ELSE 0 END) AS merged
+                FROM patches p
+                JOIN pr_outcomes o ON o.pr_url = p.pr_url
+                WHERE p.repo = ?
+                  AND p.root_cause IS NOT NULL AND p.root_cause != ''
+                  AND o.state IN ('merged', 'closed')
+                GROUP BY p.root_cause
+                ORDER BY merged DESC
+                LIMIT 3
+            """, (repo_full,)).fetchall()
+
+            # Also surface which file areas tend to merge for this repo
+            file_rows = c.execute("""
+                SELECT p.files_changed,
+                       SUM(CASE WHEN o.state='merged' THEN 1 ELSE 0 END) AS merged
+                FROM patches p
+                JOIN pr_outcomes o ON o.pr_url = p.pr_url
+                WHERE p.repo = ? AND p.files_changed IS NOT NULL
+                  AND o.state IN ('merged', 'closed')
+                GROUP BY p.files_changed
+                ORDER BY merged DESC
+                LIMIT 3
+            """, (repo_full,)).fetchall()
+
+            for rr in rrows:
+                rate = round(rr["merged"] / rr["total"] * 100) if rr["total"] else 0
+                if rate >= 40:
+                    repo_lines.append(f"{rr['root_cause'][:60]} ({rate}% merged in this repo)")
+
+            for fr in file_rows:
+                if fr["merged"] > 0 and fr["files_changed"]:
+                    repo_lines.append(f"File area '{fr['files_changed'][:40]}' has merged before")
+
+    if not global_lines and not repo_lines:
+        return ""
+
+    parts = []
+    if repo_lines:
+        parts.append("Repo history: " + "; ".join(repo_lines[:4]))
+    if global_lines:
+        parts.append("Global history: " + "; ".join(global_lines[:3]))
+
+    return "HISTORICAL CONTEXT (use to guide fix approach):\n" + "\n".join(parts)
 
 
 # ── Stats for UI ──────────────────────────────────────────────────────────────

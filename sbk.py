@@ -321,26 +321,6 @@ class RepoHunter:
         return bugs[:5]
 
 
-    def __init__(self, session: requests.Session):
-        self.session = session
-
-    def get_repo(self, name: str) -> dict | None:
-        try:
-            r = _gh_get(self.session, f"https://api.github.com/repos/{name}", timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                return {
-                    "full_name":      data["full_name"],
-                    "default_branch": data.get("default_branch", "main"),
-                }
-        except Exception:
-            pass
-        return None
-
-
-
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — LOCATE + FETCH (GitHub API, zero disk)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -349,6 +329,7 @@ class FileLocator:
         self.session = session
         self._tree_cache: dict[str, list] = {}
         self._branch_cache: dict[str, str] = {}   # repo_full → resolved branch
+        self._blob_cache: dict[str, str] = {}     # path → file content
 
     def get_tree(self, repo_full: str, default_branch: str = "") -> list:
         if repo_full in self._tree_cache:
@@ -372,6 +353,10 @@ class FileLocator:
         return []
 
     def fetch(self, repo_full: str, path: str) -> str:
+        cache_key = f"{repo_full}::{path}"
+        if cache_key in self._blob_cache:
+            return self._blob_cache[cache_key]
+
         # Try the known-good branch first (avoids a wasted HTTP round-trip)
         known = self._branch_cache.get(repo_full)
         branches = ([known] if known else []) + [b for b in ("main", "master") if b != known]
@@ -382,7 +367,10 @@ class FileLocator:
             if r.status_code == 200:
                 if branch != known:          # cache the newly discovered branch
                     self._branch_cache[repo_full] = branch
-                return r.text[:100_000]
+                
+                content = r.text[:100_000]
+                self._blob_cache[cache_key] = content
+                return content
         return ""
 
 
@@ -605,13 +593,24 @@ class Surgeon:
         bug_mag = _math.sqrt(_math.fsum(x * x for x in bug_vec)) if bug_vec else 0.0
 
         scored = []
-        for path in candidates:
+        
+        # Parallelize fetching and embedding to cut HTTP wait time
+        def _process_candidate(path):
             content = locator.fetch(repo_full, path)
             if not content:
-                continue
+                return path, None
             vec = _embed(content[:4000])
+            if not vec:
+                return path, None
             sim = db._cosine(bug_vec, vec, mag_a=bug_mag)
-            scored.append((path, sim))
+            return path, sim
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            futures = [pool.submit(_process_candidate, p) for p in candidates]
+            for fut in as_completed(futures):
+                path, sim = fut.result()
+                if sim is not None:
+                    scored.append((path, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         reranked = [p for p, _ in scored[:3]]
@@ -648,8 +647,10 @@ class Surgeon:
 
     def _call_ollama(self, bug_desc: str, file_path: str,
                      file_content: str, feedback: str = "",
-                     style_hint: str = "") -> str:
+                     style_hint: str = "", history_hint: str = "") -> str:
         user_msg = f"Bug Report:\n{bug_desc}\n\nFile: {file_path}\n```\n{file_content}\n```\n"
+        if history_hint:
+            user_msg += f"\n{history_hint}\n"
         if style_hint:
             user_msg += f"\n{style_hint}\n"
         if feedback:
@@ -850,6 +851,9 @@ class Surgeon:
         targets = self._semantic_rerank(kw_targets, bug_desc, repo_full, locator)
         emit("target", f"Candidates: {', '.join(os.path.basename(t) for t in targets)}")
 
+        # Pull historical merge patterns — pure SQLite query, <2ms, no LLM call
+        history_hint = db.get_merge_patterns(repo_full)
+
         for tf in targets:
             raw = locator.fetch(repo_full, tf)
             if not raw:
@@ -862,7 +866,9 @@ class Surgeon:
             for attempt in range(2):
                 if attempt:
                     emit("fix", "Retry with error feedback...")
-                llm_out = self._call_ollama(bug_desc, tf, context, feedback)
+                llm_out = self._call_ollama(bug_desc, tf, context, feedback,
+                                            style_hint=style_hint,
+                                            history_hint=history_hint)
                 if not llm_out:
                     break
 
@@ -873,18 +879,24 @@ class Surgeon:
                         emit_fail("think", "LLM cannot comprehend — skipping")
                         self.last_skip_reason = "comprehension"
                         break
-                    emit_ok("think", f"Root cause → {rc[:120]}")
+                    self.last_root_cause = rc
+                    emit_ok("think", f"Root cause -> {rc[:120]}")
 
                 new = self._apply_mem(llm_out, raw, tf)
                 if new is not None:
-                    # Record match details to DB
+                    # Record match details + learning data to DB
                     try:
                         m2 = RE_SEARCH_REPLACE.search(llm_out)
                         s_block = m2.group(1).strip() if m2 else ""
                         sl = len(s_block.splitlines())
                         rl = len(new.splitlines()) - len(raw.splitlines()) + sl
                         db.patch_done(repo_full, bug.get("number", 0),
-                                      patch_file=tf, lines_before=sl, lines_after=max(rl,0))
+                                      patch_file=tf,
+                                      lines_before=sl,
+                                      lines_after=max(rl, 0),
+                                      root_cause=self.last_root_cause,
+                                      files_changed=tf,
+                                      fix_lines=max(rl, 0))
                     except Exception:
                         pass
                     return {tf: new}
@@ -1222,10 +1234,14 @@ class SurgicalBugSniper:
             repo = self.hunter.get_repo(name)
             if not repo:
                 return None, []
-            return repo, self.hunter.scan_bugs(repo["full_name"])
+            bugs = self.hunter.scan_bugs(repo["full_name"])
+            # Filter to bugs we haven't successfully committed a PR for
+            fresh = [b for b in bugs
+                     if not db.already_attempted(repo["full_name"], b["number"])]
+            return repo, fresh
 
         results = []
-        max_workers = min(len(candidates), 8)   # cap thread pool — don't spin up unbounded threads
+        max_workers = min(len(candidates), 8)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for repo, bugs in [f.result() for f in as_completed(
                     [pool.submit(_fetch, n) for n in candidates])]:
@@ -1233,12 +1249,14 @@ class SurgicalBugSniper:
                     results.append((repo, bugs))
 
         if not results:
+            emit_fail("hunt", "All repos exhausted or no fresh bugs found")
             return None, []
 
+        # Pick repo with highest top-bug score
         results.sort(key=lambda x: max(self.hunter._score(b) for b in x[1]), reverse=True)
         best = results[0]
         emit_ok("hunt", f"Target: {best[0]['full_name']} "
-                        f"({len(best[1])} bug(s), score: {self.hunter._score(best[1][0])})")
+                        f"({len(best[1])} fresh bug(s), score: {self.hunter._score(best[1][0])})")
         return best
 
     def _print_summary(self):

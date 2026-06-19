@@ -223,7 +223,6 @@ _PHASE_CLASS = {
     "DRY-RUN" : "ll-think",
     "ABORT"   : "ll-fail",
     "ERROR"   : "ll-fail",
-    # v10 phases
     "TRIAGE"  : "ll-info",
     "STYLE"   : "ll-info",
     "TEST"    : "ll-patch",
@@ -384,12 +383,12 @@ st.markdown('<p class="subtitle-text">Autonomous · Local · Parallel Hunt · Su
 # ── Controls ──────────────────────────────────────────────────────────────────
 col_cap, col_btn = st.columns([5, 1])
 with col_cap:
-    st.caption("🎯 Scans LangGraph · CrewAI · LlamaIndex · Qdrant · Ollama · vLLM in parallel")
+    st.caption("Scans LangGraph · CrewAI · LlamaIndex · Qdrant · Ollama · vLLM in parallel")
 
 pid = st.session_state.get("process_pid")
 with col_btn:
     if pid is None:
-        if st.button("▶  FIRE", key="hunt_btn"):
+        if st.button("FIRE", key="hunt_btn"):
             with open(LOG_FILE, "w", encoding="utf-8") as _f:
                 _f.write("DEPLOYING...\n")
             fresh_env = {
@@ -409,7 +408,7 @@ with col_btn:
             st.rerun()
     else:
         st.markdown('<div class="abort-btn">', unsafe_allow_html=True)
-        if st.button("🛑  ABORT", key="abort_btn"):
+        if st.button("ABORT", key="abort_btn"):
             kill_hunt()
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
@@ -445,67 +444,20 @@ def live_feed():
     m = db.get_stats()
     import metrics as _m
     mc = _m.get_metrics()   # still read issues_scanned from metrics.json
-    win_color = "#00ff88" if m["win_rate"] > 50 else ("#ffaa00" if m["win_rate"] > 0 else "#888888")
     metrics_html = f"""
     <div style="border: 1px solid #222222; padding: 12px 20px; background-color: #000000; margin: 1rem 0 1.2rem 0;">
         <div style="font-family: 'Michroma', sans-serif; font-size: 0.65rem; color: #ffffff; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; border-bottom: 1px solid #222222; padding-bottom: 6px;">Contribution Metrics</div>
         <div style="display: flex; justify-content: space-between; font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; flex-wrap: wrap; gap: 10px;">
             <div><span style="color: #888888;">Issues Scanned:</span> <span style="color: #ffffff; font-weight: bold;">{mc.get('issues_scanned', 0)}</span></div>
-            <div><span style="color: #888888;">Issues Attempted:</span> <span style="color: #ffffff; font-weight: bold;">{mc.get('issues_attempted', 0)}</span></div>
             <div><span style="color: #888888;">PRs Opened:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_opened']}</span></div>
             <div><span style="color: #888888;">PRs Merged:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_merged']}</span></div>
-            <div><span style="color: #888888;">PRs Closed:</span> <span style="color: #ffffff; font-weight: bold;">{m['prs_closed']}</span></div>
-            <div><span style="color: #888888;">Win Rate:</span> <span style="color: {win_color}; font-weight: bold;">{m['win_rate']}%</span></div>
             <div><span style="color: #888888;">Total Runs:</span> <span style="color: #ffffff; font-weight: bold;">{m['total_runs']}</span></div>
         </div>
     </div>
     """
     st.markdown(metrics_html, unsafe_allow_html=True)
 
-    # ── PR Outcome Tracker ────────────────────────────────────────────────────
-    open_prs = db.pr_open_list()
-    all_recent = m.get("recent_prs", [])
-    if all_recent:
-        col_pr_hdr, col_refresh = st.columns([5, 1])
-        with col_pr_hdr:
-            st.markdown(
-                f'<p class="feed-label">PR Outcome Tracker'
-                f'<span class="status-badge badge-idle">{len(open_prs)} OPEN</span></p>',
-                unsafe_allow_html=True)
-        with col_refresh:
-            if st.button("🔄  Poll", key="poll_btn", help="Check GitHub for latest PR status"):
-                token = os.getenv("GITHUB_TOKEN", "")
-                for pr in open_prs:
-                    try:
-                        api_url = pr["pr_url"].replace(
-                            "github.com", "api.github.com/repos"
-                        ).replace("/pull/", "/pulls/")
-                        r = requests.get(api_url,
-                            headers={"Authorization": f"token {token}",
-                                     "Accept": "application/vnd.github.v3+json"},
-                            timeout=10)
-                        if r.status_code == 200:
-                            data   = r.json()
-                            merged = data.get("merged", False)
-                            state  = data.get("state", "open")
-                            if merged:
-                                db.pr_update(pr["pr_url"], "merged",
-                                             data.get("merged_at", ""))
-                            elif state == "closed":
-                                db.pr_update(pr["pr_url"], "closed")
-                    except Exception:
-                        pass
-                st.rerun()
 
-        STATE_ICON = {"open": "⏳", "merged": "✅", "closed": "❌"}
-        rows = []
-        for p in all_recent:
-            icon  = STATE_ICON.get(p["state"], "")
-            repo_short = p["pr_url"].split("github.com/")[-1].split("/pull/")[0]
-            rows.append(
-                f"{icon} [{repo_short}#{p['pr_number']}]({p['pr_url']}) "
-                f"— issue #{p['issue_number']} — **{p['state']}**")
-        st.markdown("\n\n".join(rows))
 
     # ── Feed header ──────────────────────────────────────────────────────────
 
