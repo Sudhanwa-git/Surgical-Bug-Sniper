@@ -414,14 +414,69 @@ _AI_COMMENT_PREFIXES = (
 )
 
 
+# ── Style Sampler ───────────────────────────────────────────────────────────────────
+class StyleSampler:
+    """Sample a few files from the repo to detect code style conventions."""
+
+    @staticmethod
+    def detect(contents: list[str]) -> str:
+        """Return a one-line style hint from up to 3 sampled file contents."""
+        combined = "\n".join(contents[:3])
+        lines    = combined.splitlines()
+
+        # Indentation
+        indent = "4-space"
+        tab_lines   = sum(1 for l in lines if l.startswith("\t"))
+        two_lines   = sum(1 for l in lines if l.startswith("  ") and not l.startswith("    "))
+        four_lines  = sum(1 for l in lines if l.startswith("    "))
+        if tab_lines > max(two_lines, four_lines):
+            indent = "tab"
+        elif two_lines > four_lines:
+            indent = "2-space"
+
+        # Quote style (look at string literals)
+        single = combined.count("'") 
+        double = combined.count('"')
+        quotes = "single quotes" if single > double else "double quotes"
+
+        return f"Style hint: use {indent} indentation, {quotes}."
+
+
+# ── Test Finder ───────────────────────────────────────────────────────────────────
+class TestFinder:
+    """Locate or derive the test file path for a source file."""
+
+    def find(self, source_path: str, tree: list) -> str | None:
+        fname = os.path.basename(source_path).removesuffix(".py")
+        candidates = {f"test_{fname}.py", f"{fname}_test.py"}
+        for path in tree:
+            if os.path.basename(path) in candidates and "test" in path.lower():
+                return path
+        return None
+
+    def derive_path(self, source_path: str, tree: list) -> str:
+        """Return existing test path or a sensible new path."""
+        existing = self.find(source_path, tree)
+        if existing:
+            return existing
+        fname = os.path.basename(source_path).removesuffix(".py")
+        # Mirror the source dir under tests/
+        parts = source_path.replace("\\", "/").split("/")
+        sub   = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+        return f"tests/{sub + '/' if sub else ''}test_{fname}.py"
+
+
 class Surgeon:
     def __init__(self, model: str, ollama_base: str, session: requests.Session):
         self.model       = model.split("/")[-1]
         self.ollama_base = ollama_base.rstrip("/")
-        self.ctx_chars   = int(os.getenv("SURGERY_CONTEXT_CHARS", "35000"))
+        self.ctx_chars   = int(os.getenv("SURGERY_CONTEXT_CHARS", "18000"))  # was 35000
         self.timeout     = int(os.getenv("SURGERY_TIMEOUT_SEC",  "180"))
         self.session     = session
         self.last_skip_reason: str | None = None
+        self.last_root_cause:  str        = ""
+        self.last_test_code:   str        = ""
+        self.last_test_path:   str        = ""
 
     def _ollama_ok(self) -> bool:
         try:
@@ -573,12 +628,15 @@ class Surgeon:
         return "\n".join(lines[start:end])
 
     def _call_ollama(self, bug_desc: str, file_path: str,
-                     file_content: str, feedback: str = "") -> str:
-        user_msg = f"Bug Report:\n{bug_desc}\n\nFile: {file_path}\n```\n{file_content}\n```\n\n"
+                     file_content: str, feedback: str = "",
+                     style_hint: str = "") -> str:
+        user_msg = f"Bug Report:\n{bug_desc}\n\nFile: {file_path}\n```\n{file_content}\n```\n"
+        if style_hint:
+            user_msg += f"\n{style_hint}\n"
         if feedback:
-            user_msg += f"Previous attempt failed:\n{feedback}\n\nProduce a corrected SEARCH/REPLACE. Start with <<<SEARCH>>> immediately:"
+            user_msg += f"\nPrevious attempt failed:\n{feedback}\n\nProduce a corrected SEARCH/REPLACE. Start with <<<SEARCH>>> immediately:"
         else:
-            user_msg += "Produce the SEARCH/REPLACE block to fix this bug:"
+            user_msg += "\nProduce the fix:"
         payload = {
             "model": self.model,
             "messages": [
@@ -586,7 +644,7 @@ class Surgeon:
                 {"role": "user",   "content": user_msg},
             ],
             "stream": True,
-            "options": {"temperature": 0.05, "num_predict": 2048},
+            "options": {"temperature": 0.05, "num_predict": 1400},  # was 2048
         }
         try:
             emit("fix", "LLM generating patch...")
@@ -735,14 +793,18 @@ class Surgeon:
 
         sn, rn = len(s.strip().splitlines()), len(r.strip().splitlines())
         emit_ok("fix", f"Patched {os.path.basename(path)} ({mt}, {sn}→{rn} lines)")
-        # Emit a human-readable diff so the live feed shows exactly what changed
         emit_patch_summary(path, s, r, mt)
+
         return new
 
     def operate(self, bug: dict, repo_full: str,
-                tree: list, locator: "FileLocator") -> dict:
+                 tree: list, locator: "FileLocator",
+                 style_hint: str = "", test_finder: "TestFinder | None" = None) -> dict:
         """Returns {path: new_content} on success, {} on failure."""
         self.last_skip_reason = None
+        self.last_root_cause  = ""
+        self.last_test_code   = ""
+        self.last_test_path   = ""
 
         if not self._ollama_ok():
             self.last_skip_reason = "ollama"
@@ -757,7 +819,7 @@ class Surgeon:
                 emit("think", f"Loaded {ctx.count('@')} comment(s) for context")
                 body += "\n\n--- Discussion ---\n" + ctx
 
-        bug_desc = f"Title: {title}\n\n{body[:3000]}"
+        bug_desc   = f"Title: {title}\n\n{body[:3000]}"
         kw_targets = self._find_targets(title, body, tree)
 
         if not kw_targets:
@@ -775,7 +837,7 @@ class Surgeon:
                 emit_fail("fetch", f"Cannot fetch {os.path.basename(tf)}")
                 continue
 
-            context = self._extract_context(raw, title, body)
+            context  = self._extract_context(raw, title, body)
             feedback = ""
 
             for attempt in range(2):
