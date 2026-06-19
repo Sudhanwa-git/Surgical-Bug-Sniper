@@ -565,6 +565,23 @@ class Surgeon:
 
         embed_model = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
+        # ── Fast pre-check: is the embed model actually installed? ────────────
+        try:
+            r = self.session.get(f"{self.ollama_base}/api/tags", timeout=5)
+            if r.status_code == 200:
+                installed = [m["name"] for m in r.json().get("models", [])]
+                tag = embed_model if ":" in embed_model else embed_model + ":latest"
+                base = tag.split(":")[0]
+                if not any(m.startswith(base) for m in installed):
+                    emit_fail("embed",
+                        f"Model '{embed_model}' not installed. "
+                        f"Run:  ollama pull {embed_model}  "
+                        f"OR set EMBED_MODEL=qwen2.5-coder:7b in .env to reuse existing model. "
+                        f"Installed: {', '.join(installed)}")
+                    return candidates[:3]
+        except Exception:
+            pass
+
         def _embed(text: str) -> list:
             try:
                 r = self.session.post(
@@ -573,13 +590,14 @@ class Surgeon:
                     timeout=30)
                 if r.status_code == 200:
                     return r.json().get("embedding", [])
-            except Exception:
-                pass
+                emit_fail("embed", f"Ollama embedding HTTP {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                emit_fail("embed", f"Embedding call failed: {e}")
             return []
 
         bug_vec = _embed(bug_desc)
         if not bug_vec:
-            emit("embed", "Embedding unavailable — using keyword ranking")
+            emit("embed", "Embedding unavailable — falling back to keyword ranking")
             return candidates[:3]
 
         # Precompute query magnitude once — reused for every file comparison
@@ -600,6 +618,7 @@ class Surgeon:
         if reranked:
             emit_ok("embed", f"Semantic rerank → {', '.join(os.path.basename(p) for p in reranked)}")
         return reranked or candidates[:3]
+
 
     def _extract_context(self, content: str, title: str, body: str) -> str:
         if len(content) <= self.ctx_chars:
@@ -920,17 +939,61 @@ class Committer:
         return None
 
     def _create_pr(self, repo_full: str, branch: str, bug_number: int,
-                   bug_title: str, github_user: str, headers: dict) -> str | None:
-        body = (f"Fixes #{bug_number}\n\n"
-                f"Resolves: **{bug_title}**\n\n"
-                f"---\n*Verified: AST checks passed ✓*")
-        title = f"fix: resolve issue #{bug_number} — {bug_title[:60]}"
+                   bug_title: str, github_user: str, headers: dict,
+                   root_cause: str = "", fix_file: str = "",
+                   test_path: str = "") -> str | None:
+        # Derive scope for conventional commit (e.g. "graph" from langgraph/graph/state.py)
+        scope = ""
+        if fix_file:
+            parts = fix_file.replace("\\", "/").split("/")
+            scope = parts[-2] if len(parts) >= 2 else parts[0].removesuffix(".py")
+
+        commit_title = (
+            f"fix({scope}): resolve #{bug_number} — {bug_title[:55]}"
+            if scope else
+            f"fix: resolve issue #{bug_number} — {bug_title[:60]}"
+        )
+
+        # Changed files section
+        fix_fname  = os.path.basename(fix_file) if fix_file else "(unknown)"
+        test_fname = os.path.basename(test_path) if test_path else ""
+        files_md   = f"- **`{fix_fname}`** — patched the root-cause code path"
+        if test_fname:
+            files_md += f"\n- **`{test_fname}`** — added regression test"
+
+        # Verification checklist
+        test_check = "x" if test_path else " "
+        rc_text    = root_cause if root_cause else "_See inline code change for details._"
+
+        body = f"""\
+## Summary
+
+Fixes #{bug_number} — {bug_title}
+
+## Root Cause
+
+{rc_text}
+
+## Changes
+
+{files_md}
+
+## Verification
+
+- [x] AST syntax check passed
+- [x] Undefined-variable guard passed
+- [x] Fix is minimal — no unrelated changes
+- [{test_check}] Regression test added
+
+---
+*Automated fix — please review before merging.*
+"""
         for base in ("main", "master"):
             try:
                 r = self.session.post(
                     f"https://api.github.com/repos/{repo_full}/pulls",
                     headers=headers,
-                    json={"title": title, "body": body,
+                    json={"title": commit_title, "body": body,
                           "head": f"{github_user}:{branch}", "base": base},
                     timeout=15)
                 if r.status_code in (200, 201):
@@ -965,7 +1028,9 @@ class Committer:
         return False
 
     def push(self, repo: dict, bug: dict, github_user: str,
-             token: str, headers: dict, results: dict) -> bool:
+             token: str, headers: dict, results: dict,
+             root_cause: str = "", test_code: str = "",
+             test_path: str = "") -> bool:
         self.last_pr_url = None
         repo_full  = repo["full_name"]
         repo_short = repo_full.split("/")[-1]
@@ -1018,9 +1083,14 @@ class Committer:
                 return False
             base_tree_sha = r.json()["tree"]["sha"]
 
-            # Blobs → tree
+            # Blobs → tree  (fix file + optional test file)
+            all_files = dict(results)  # copy to avoid mutating caller's dict
+            if test_code and test_path:
+                all_files[test_path] = test_code
+                emit_ok("test", f"Including test file in commit: {os.path.basename(test_path)}")
+
             tree_items = []
-            for file_path, content in results.items():
+            for file_path, content in all_files.items():
                 rb = self.session.post(
                     f"https://api.github.com/repos/{github_user}/{repo_short}/git/blobs",
                     headers=headers,
@@ -1042,11 +1112,21 @@ class Committer:
                 return False
             new_tree_sha = rt.json()["sha"]
 
-            # Commit
+            # Commit — conventional commit message with scope
+            fix_path = next(iter(results), "")
+            scope    = ""
+            if fix_path:
+                parts = fix_path.replace("\\", "/").split("/")
+                scope = parts[-2] if len(parts) >= 2 else ""
+            commit_msg = (
+                f"fix({scope}): resolve issue #{bug_number}"
+                if scope else
+                f"fix: resolve issue #{bug_number}"
+            )
             rc = self.session.post(
                 f"https://api.github.com/repos/{github_user}/{repo_short}/git/commits",
                 headers=headers,
-                json={"message": f"fix: resolve issue #{bug_number}",
+                json={"message": commit_msg,
                       "tree": new_tree_sha, "parents": [head_sha]},
                 timeout=15)
             if rc.status_code not in (200, 201):
@@ -1066,8 +1146,13 @@ class Committer:
 
             emit_ok("push", f"Branch live → {github_user}/{repo_short}/tree/{branch}")
 
-            pr_url = self._create_pr(repo_full, branch, bug_number,
-                                     bug.get("title",""), github_user, headers)
+            pr_url = self._create_pr(
+                repo_full, branch, bug_number,
+                bug.get("title",""), github_user, headers,
+                root_cause=root_cause,
+                fix_file=next(iter(results), ""),
+                test_path=test_path if test_code else "",
+            )
             self.last_pr_url = pr_url
 
             # Extract PR number from URL for DB tracking
@@ -1116,11 +1201,13 @@ class SurgicalBugSniper:
         except Exception as e:
             emit_fail("init", f"GitHub error: {e}")
 
-        self.hunter    = RepoHunter(self.session)
-        self.locator   = FileLocator(self.session)
-        self.surgeon   = Surgeon(self.model, self.ollama_base, self.session)
-        self.verifier  = Verifier()
-        self.committer = Committer(self.session)
+        self.hunter      = RepoHunter(self.session)
+        self.locator     = FileLocator(self.session)
+        self.surgeon     = Surgeon(self.model, self.ollama_base, self.session)
+        self.verifier    = Verifier()
+        self.committer   = Committer(self.session)
+        self.style_sampler = StyleSampler()
+        self.test_finder   = TestFinder()
 
         self.summary = {
             "repo": None, "bugs_scanned": 0, "bugs_attempted": 0,
@@ -1179,8 +1266,8 @@ class SurgicalBugSniper:
 
         print(flush=True)
         print(" ═══════════════════════════════════════════════════════════", flush=True)
-        print("  SURGICAL BUG SNIPER  v9  ·  Zero-Disk · Quality-First", flush=True)
-        print("  HUNT → FETCH → FIX → VERIFY → PUSH → PR", flush=True)
+        print("  SURGICAL BUG SNIPER  v10  ·  Zero-Disk · Quality-First", flush=True)
+        print("  HUNT → TRIAGE → STYLE → FIX+TEST → VERIFY → PUSH → PR", flush=True)
         print(" ═══════════════════════════════════════════════════════════", flush=True)
         print(flush=True)
 
@@ -1231,7 +1318,19 @@ class SurgicalBugSniper:
                 db.mark_attempted(repo_full, issue_id,   # mark before attempt — avoids re-runs on crash
                                   title=bug.get("title",""), run_id=run_id)
 
-                results = self.surgeon.operate(bug, repo_full, tree, self.locator)
+                # ── Sample repo style (fast, no LLM) ───────────────────────────────
+                py_samples = [p for p in tree if p.endswith(".py") and "test" not in p.lower()][:3]
+                style_hint = ""
+                if py_samples:
+                    contents = [self.locator.fetch(repo_full, p) for p in py_samples]
+                    style_hint = self.style_sampler.detect([c for c in contents if c])
+                    emit("style", style_hint)
+
+                results = self.surgeon.operate(
+                    bug, repo_full, tree, self.locator,
+                    style_hint=style_hint,
+                    test_finder=self.test_finder,
+                )
                 if not results:
                     reason = self.surgeon.last_skip_reason
                     self.summary["skipped_comprehension" if reason == "comprehension" else "skipped_no_fix"] += 1
@@ -1254,8 +1353,15 @@ class SurgicalBugSniper:
                     emit_fail("push", "No GitHub auth — cannot push")
                     continue
 
-                if self.committer.push(repo=repo, bug=bug, github_user=self.github_user,
-                                       token=self.token, headers=self.headers, results=results):
+                if self.committer.push(
+                        repo=repo, bug=bug,
+                        github_user=self.github_user,
+                        token=self.token, headers=self.headers,
+                        results=results,
+                        root_cause=self.surgeon.last_root_cause,
+                        test_code=self.surgeon.last_test_code,
+                        test_path=self.surgeon.last_test_path,
+                ):
                     self.summary["pr_url"] = self.committer.last_pr_url or "pushed (no PR)"
                     db.patch_done(repo_full, issue_id, pr_url=self.committer.last_pr_url)
                     db.run_finish(run_id, outcome="success",
