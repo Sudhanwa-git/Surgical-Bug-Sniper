@@ -53,6 +53,7 @@ def init_db():
                 root_cause    TEXT,           -- extracted root cause sentence from LLM
                 files_changed TEXT,           -- comma-separated relative paths
                 fix_lines     INTEGER,        -- net lines changed (after - before)
+                llm_raw_output TEXT,           -- full LLM response (for fine-tune export)
                 attempted_at  TEXT    NOT NULL,
                 UNIQUE(repo, issue_number)
             );
@@ -73,9 +74,10 @@ def init_db():
         with _conn() as c:
             existing = {row[1] for row in c.execute("PRAGMA table_info(patches)")}
             for col, typedef in [
-                ("root_cause",    "TEXT"),
-                ("files_changed", "TEXT"),
-                ("fix_lines",     "INTEGER"),
+                ("root_cause",     "TEXT"),
+                ("files_changed",  "TEXT"),
+                ("fix_lines",      "INTEGER"),
+                ("llm_raw_output", "TEXT"),
             ]:
                 if col not in existing:
                     c.execute(f"ALTER TABLE patches ADD COLUMN {col} {typedef}")

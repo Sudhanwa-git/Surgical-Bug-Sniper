@@ -83,14 +83,32 @@ def _llm_log(text: str):
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Python-only AI repos with responsive maintainers & active community PRs
+# Python-only AI/ML repos — active maintainers, quick PR turnaround, ~30d merge window
+# Kept within the same ecosystem so per-repo learning signal stays coherent
 WHITELIST = [
+    # High throughput — lots of labelled issues, quick reviews
+    "BerriAI/litellm",
     "langchain-ai/langgraph",
-    "BerriAI/litellm",          # high issue throughput, quick merges
-    "joaomdmoura/crewAI",
     "run-llama/llama_index",
+    "joaomdmoura/crewAI",
+    # Approachable codebases — smaller surface area, higher merge rate on first PRs
+    "instructor-ai/instructor",
+    "guidance-ai/guidance",
+    "chroma-db/chroma",
+    "lancedb/lancedb",
+    # SDK / tooling — well-scoped bugs, clean PR bar
+    "openai/openai-python",
+    "anthropics/anthropic-sdk-python",
+    "cohere-ai/cohere-python",
+    # Infra / serving — active issue boards
     "vllm-project/vllm",
     "microsoft/autogen",
+    "skypilot-org/skypilot",
+    # Data / eval
+    "huggingface/datasets",
+    "explodinggradients/ragas",
+    "confident-ai/deepeval",
+    "AnswerDotAI/fasthtml",         # active Python web framework, responsive maintainers
 ]
 
 # Maintainer-blessed labels — these signal "we WANT a PR for this"
@@ -896,7 +914,8 @@ class Surgeon:
                                       lines_after=max(rl, 0),
                                       root_cause=self.last_root_cause,
                                       files_changed=tf,
-                                      fix_lines=max(rl, 0))
+                                      fix_lines=max(rl, 0),
+                                      llm_raw_output=llm_out)
                     except Exception:
                         pass
                     return {tf: new}
@@ -1276,11 +1295,60 @@ class SurgicalBugSniper:
         elif s["fix_file"]:   print("  PR opened         push failed", flush=True)
         print(" ═══════════════════════════════════════════════════════════", flush=True)
 
+    def _sync_pr_outcomes(self):
+        """
+        Silently poll GitHub for every open PR in the DB and update its state.
+        Runs at the top of each agent run — no manual intervention needed.
+        Outcomes (merged/closed) feed directly into the learning system.
+        """
+        open_prs = db.pr_open_list()
+        if not open_prs:
+            return
+
+        emit("sync", f"Syncing {len(open_prs)} open PR(s) with GitHub...")
+        updated = 0
+
+        def _poll(pr):
+            try:
+                api_url = (
+                    pr["pr_url"]
+                    .replace("github.com", "api.github.com/repos")
+                    .replace("/pull/", "/pulls/")
+                )
+                r = self.session.get(api_url, headers=self.headers, timeout=10)
+                if r.status_code != 200:
+                    return None
+                data   = r.json()
+                merged = data.get("merged", False)
+                state  = data.get("state", "open")
+                if merged:
+                    return pr["pr_url"], "merged", data.get("merged_at", "")
+                if state == "closed":
+                    return pr["pr_url"], "closed", ""
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=min(len(open_prs), 6)) as pool:
+            for result in [f.result() for f in as_completed(
+                    [pool.submit(_poll, pr) for pr in open_prs])]:
+                if result:
+                    url, state, merged_at = result
+                    db.pr_update(url, state, merged_at)
+                    updated += 1
+
+        if updated:
+            emit_ok("sync", f"{updated} PR outcome(s) updated")
+
     def run(self):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         t_start = time.time()
         db.init_db()
         db.run_start(run_id)
+
+        # Silently sync all open PR outcomes before anything else
+        # so the learning system always reads fresh data this run
+        self._sync_pr_outcomes()
 
         print(flush=True)
         print(" ═══════════════════════════════════════════════════════════", flush=True)
