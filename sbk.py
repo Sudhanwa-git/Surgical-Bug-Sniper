@@ -396,21 +396,19 @@ class FileLocator:
 # STEP 3 — SURGERY
 # ═══════════════════════════════════════════════════════════════════════════════
 SURGERY_SYSTEM = """\
-You are a precise code repair tool. You receive a bug report and a source file.
-Output the fix in a single response.
+Code repair tool. Bug report + source file in. Fix out.
 
-Line 1 MUST BE:
-ROOT_CAUSE: [one sentence — the exact bug]
-If you cannot understand the bug, output only: ROOT_CAUSE: INCOMPREHENSIBLE
+Line 1: ROOT_CAUSE: [one sentence — exact bug]
+If bug is unclear: ROOT_CAUSE: INCOMPREHENSIBLE
 
-Then output EXACTLY one SEARCH/REPLACE block:
+Then ONE block:
 <<<SEARCH>>>
-[exact lines from the file, character-for-character]
+[exact lines, character-for-character]
 <<<REPLACE>>>
-[corrected lines — minimal change only]
+[minimal corrected lines]
 <<<END>>>
 
-RULES: No prose before ROOT_CAUSE or after <<<END>>>. No markdown fences. No "# Fixed" comments. Match SEARCH exactly."""
+No prose. No markdown fences. No added comments. SEARCH must match file exactly."""
 
 
 _AI_COMMENT_PREFIXES = (
@@ -476,7 +474,7 @@ class Surgeon:
     def __init__(self, model: str, ollama_base: str, session: requests.Session):
         self.model       = model.split("/")[-1]
         self.ollama_base = ollama_base.rstrip("/")
-        self.ctx_chars   = int(os.getenv("SURGERY_CONTEXT_CHARS", "18000"))  # was 35000
+        self.ctx_chars   = int(os.getenv("SURGERY_CONTEXT_CHARS", "6000"))   # 7B sweet spot: short, focused
         self.timeout     = int(os.getenv("SURGERY_TIMEOUT_SEC",  "180"))
         self.session     = session
         self.last_skip_reason: str | None = None
@@ -682,7 +680,7 @@ class Surgeon:
                 {"role": "user",   "content": user_msg},
             ],
             "stream": True,
-            "options": {"temperature": 0.05, "num_predict": 1400},  # was 2048
+            "options": {"temperature": 0.05, "num_predict": 600},   # surgical fix <= 350 tokens; 600 = safe headroom
         }
         try:
             emit("fix", "LLM generating patch...")
@@ -857,7 +855,7 @@ class Surgeon:
                 emit("think", f"Loaded {ctx.count('@')} comment(s) for context")
                 body += "\n\n--- Discussion ---\n" + ctx
 
-        bug_desc   = f"Title: {title}\n\n{body[:3000]}"
+        bug_desc   = f"Title: {title}\n\n{body[:1200]}"
         kw_targets = self._find_targets(title, body, tree)
 
         if not kw_targets:
