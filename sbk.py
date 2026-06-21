@@ -333,7 +333,7 @@ class RepoHunter:
             except Exception:
                 pass
 
-        bugs = [b for b in bugs if self._score(b) >= 20]
+        bugs = [b for b in bugs if self._score(b) >= 30]
         bugs.sort(key=self._score, reverse=True)
         emit("hunt", f"Scanned {repo_full} \u2192 {len(bugs)} solvable bug(s)")
         return bugs[:5]
@@ -680,7 +680,12 @@ class Surgeon:
                 {"role": "user",   "content": user_msg},
             ],
             "stream": True,
-            "options": {"temperature": 0.05, "num_predict": 600},   # surgical fix <= 350 tokens; 600 = safe headroom
+            "options": {
+                "temperature": 0.05,
+                "num_predict": 600,    # surgical fix <= 350 tokens; 600 = safe headroom
+                "num_ctx":     2048,   # match our actual input size — smaller KV cache = faster
+                "keep_alive":  "30m", # keep model hot in VRAM between calls
+            },
         }
         try:
             emit("fix", "LLM generating patch...")
@@ -691,6 +696,7 @@ class Surgeon:
                 emit_fail("fix", f"Ollama HTTP {r.status_code}")
                 return ""
             chunks = []
+            full   = ""
             for raw in r.iter_lines():
                 if not raw:
                     continue
@@ -702,6 +708,10 @@ class Surgeon:
                 if tok:
                     _llm_log(tok)
                     chunks.append(tok)
+                    full += tok
+                    # Early-exit: no need to wait for done:true once END marker seen
+                    if "<<<END>>>" in full:
+                        break
                 if obj.get("done"):
                     break
             _llm_log("\n--- END ---\n")
@@ -1237,6 +1247,19 @@ class SurgicalBugSniper:
         self.committer   = Committer(self.session)
         self.style_sampler = StyleSampler()
         self.test_finder   = TestFinder()
+        self._style_cache: dict[str, str] = {}   # repo_full -> style_hint; cached once per run
+
+        # Pre-warm Ollama so first real call hits a hot model, not a cold load
+        try:
+            self.session.post(
+                f"{self.ollama_base}/api/chat",
+                json={"model": self.surgeon.model,
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "stream": False,
+                      "options": {"num_predict": 1, "num_ctx": 512, "keep_alive": "30m"}},
+                timeout=60)
+        except Exception:
+            pass  # non-fatal — first real call will load the model
 
         self.summary = {
             "repo": None, "bugs_scanned": 0, "bugs_attempted": 0,
@@ -1402,12 +1425,14 @@ class SurgicalBugSniper:
                 db.mark_attempted(repo_full, issue_id,   # mark before attempt — avoids re-runs on crash
                                   title=bug.get("title",""), run_id=run_id)
 
-                # ── Sample repo style (fast, no LLM) ───────────────────────────────
-                py_samples = [p for p in tree if p.endswith(".py") and "test" not in p.lower()][:3]
-                style_hint = ""
-                if py_samples:
-                    contents = [self.locator.fetch(repo_full, p) for p in py_samples]
-                    style_hint = self.style_sampler.detect([c for c in contents if c])
+                # ── Sample repo style once per run, cache it ─────────────────────
+                if repo_full not in self._style_cache:
+                    py_samples = [p for p in tree if p.endswith(".py") and "test" not in p.lower()][:3]
+                    if py_samples:
+                        contents = [self.locator.fetch(repo_full, p) for p in py_samples]
+                        self._style_cache[repo_full] = self.style_sampler.detect([c for c in contents if c])
+                style_hint = self._style_cache.get(repo_full, "")
+                if style_hint:
                     emit("style", style_hint)
 
                 results = self.surgeon.operate(
