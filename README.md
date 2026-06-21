@@ -16,7 +16,7 @@ An autonomous AI agent that scans open-source AI INFRA and tooling repositories 
   └──────────────┘     └─────────┘     └──────────────┘     └────────┘     └──────────┘
 ```
 
-**Hunt** → Scans 6 repos in parallel via GitHub REST API. Scores each bug by solvability — tracebacks, error types, and code blocks score high; GPU/distributed/concurrency issues are filtered out.
+**Hunt** → Scans multiple repos in parallel via GitHub REST API. Scores each bug by solvability — tracebacks, error types, and code blocks score high; GPU/distributed/concurrency issues are filtered out.
 
 **Clone** → Shallow blobless clone (`--depth 1 --filter=blob:none`) to a temp directory. Fast, minimal disk usage.
 
